@@ -41,7 +41,7 @@ MKFS_OBJS := $(BUILD)/host_tinyfs.o $(BUILD)/host_mkfs_tinyfs.o
 MKFS_SEED_FILES := tests/hello.tsh tests/hello.tc
 MKFS_SEED_SPECS := tests/hello.tsh:hello.tsh tests/hello.tc:hello.tc
 
-.PHONY: all run clean
+.PHONY: all run run-gui clean
 
 all: $(DISK_IMG)
 
@@ -92,8 +92,17 @@ $(DISK_IMG): $(BOOT_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(MKFS_BIN) $(MKFS_SEED_FIL
 	dd if=$(KERNEL_BIN) of=$@ bs=512 seek=$(KERNEL_START_SECTOR) conv=notrunc status=none
 	$(MKFS_BIN) $@ $(MKFS_SEED_SPECS)
 
+# Headless: no window at all, so there's no input surface for the emulated
+# PS/2 keyboard - useful for a quick boot sanity check or scripting, but
+# you cannot type into the shell this way. Use `make run-gui` to interact.
 run: $(DISK_IMG)
 	$(QEMU) -drive file=$(DISK_IMG),format=raw -display none -serial stdio -no-reboot
+
+# Opens a real window - click into it, then type. Serial output is also
+# echoed to this terminal, but keystrokes only reach the guest via the
+# window.
+run-gui: $(DISK_IMG)
+	$(QEMU) -drive file=$(DISK_IMG),format=raw -serial stdio -no-reboot
 
 clean:
 	rm -rf $(BUILD)
