@@ -1,0 +1,7 @@
+hello from tinyfs script
+x = 14
+add(3,4) = 7
+loop 0
+loop 1
+loop 2
+written by script

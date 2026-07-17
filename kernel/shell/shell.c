@@ -5,6 +5,7 @@
 #include "console.h"
 #include "fs/tinyfs.h"
 #include "keyboard.h"
+#include "lang/script/eval.h"
 #include "serial.h"
 #include "string.h"
 
@@ -71,7 +72,7 @@ static int next_word(const char **p, char *out, int max_len) {
 }
 
 static void cmd_help(void) {
-    print_line("commands: ls, cat <file>, write <file> <text>, rm <file>, help, clear, reboot");
+    print_line("commands: ls, cat <file>, write <file> <text>, rm <file>, run <file>, help, clear, reboot");
 }
 
 static void cmd_ls(void) {
@@ -118,6 +119,17 @@ static void cmd_write(const char *name, const char *contents) {
         return;
     }
     print_line("write: ok");
+}
+
+static void cmd_run(const char *name) {
+    static char buf[TINYFS_MAX_FILE_SIZE + 1];
+    uint32_t len = 0;
+    if (tinyfs_read(name, buf, sizeof(buf) - 1, &len) != 0) {
+        print_line("run: no such file");
+        return;
+    }
+    buf[len] = '\0';
+    script_run(buf);
 }
 
 static void cmd_rm(const char *name) {
@@ -177,6 +189,13 @@ void shell_run(void) {
                 print_line("usage: rm <file>");
             } else {
                 cmd_rm(name);
+            }
+        } else if (strcmp(cmd, "run") == 0) {
+            char name[TINYFS_NAME_MAX];
+            if (next_word(&p, name, sizeof(name)) == 0) {
+                print_line("usage: run <file>");
+            } else {
+                cmd_run(name);
             }
         } else if (strcmp(cmd, "write") == 0) {
             char name[TINYFS_NAME_MAX];

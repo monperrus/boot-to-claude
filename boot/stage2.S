@@ -7,7 +7,7 @@ ORG 0x7e00
 
 KERNEL_LOAD_ADDR equ 0x10000  ; 64KB - plenty of conventional memory headroom
 KERNEL_START_LBA equ 5        ; right after stage1 (LBA 0) + stage2 (LBA 1-4)
-KERNEL_SECTORS   equ 64       ; 32KB kernel image budget for now
+KERNEL_SECTORS   equ 512      ; 256KB kernel image budget (must match Makefile/tinyfs.h)
 
 stage2_start:
     mov si, msg_stage2
@@ -47,12 +47,52 @@ enable_a20:
     out 0x92, al
     ret
 
+; Reads the kernel in CHUNK_SECTORS-sized pieces rather than one single
+; INT13h AH=0x42 call - BIOSes (including SeaBIOS) commonly cap how many
+; sectors a single extended read will reliably transfer well below 512,
+; and silently misbehave past that rather than returning an error.
+CHUNK_SECTORS equ 64
+
 load_kernel:
+    mov word [kernel_remaining], KERNEL_SECTORS
+    mov dword [kernel_lba], KERNEL_START_LBA
+    mov word [kernel_dest_seg], (KERNEL_LOAD_ADDR >> 4)
+
+.loop:
+    mov ax, [kernel_remaining]
+    cmp ax, 0
+    je .done
+    cmp ax, CHUNK_SECTORS
+    jbe .chunk_size_ok
+    mov ax, CHUNK_SECTORS
+.chunk_size_ok:
+    ; ax = sectors to transfer this iteration
+
+    mov [dap_sectors], ax
+    mov si, [kernel_dest_seg]
+    mov [dap_segment], si
+    mov word [dap_offset], 0
+    mov ebx, [kernel_lba]
+    mov [dap_lba], ebx
+    mov dword [dap_lba + 4], 0
+
+    push ax
     mov si, dap
     mov ah, 0x42
     mov dl, 0x80
     int 0x13
     jc disk_error
+    pop ax
+
+    movzx eax, ax                  ; sectors transferred, zero-extended
+    add dword [kernel_lba], eax
+    sub word [kernel_remaining], ax
+    mov cx, ax
+    shl cx, 5                       ; sectors * (512/16) = paragraphs advanced
+    add word [kernel_dest_seg], cx
+
+    jmp .loop
+.done:
     ret
 
 disk_error:
@@ -62,14 +102,18 @@ disk_error:
     hlt
     jmp .hang
 
+kernel_remaining: dw 0
+kernel_lba:       dd 0
+kernel_dest_seg:  dw 0
+
 align 4
 dap:
-    db 0x10
-    db 0
-    dw KERNEL_SECTORS
-    dw KERNEL_LOAD_ADDR & 0xFFFF          ; offset  (0x0000)
-    dw (KERNEL_LOAD_ADDR >> 4) & 0xFFFF   ; segment (0x1000)
-    dq KERNEL_START_LBA
+dap_size:    db 0x10
+             db 0
+dap_sectors: dw 0
+dap_offset:  dw 0
+dap_segment: dw 0
+dap_lba:     dq 0
 
 msg_stage2:   db "stage2 ", 0
 msg_disk_err: db "kernel disk err", 0

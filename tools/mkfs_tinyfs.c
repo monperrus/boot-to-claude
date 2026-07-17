@@ -35,9 +35,26 @@ static void seed_file(const char *name, const char *contents) {
     tinyfs_write(name, contents, (uint32_t)strlen(contents));
 }
 
+/* Seeds a tinyfs file straight from a host file, for test fixtures under
+ * tests/ so their source lives in one place instead of being duplicated
+ * as a C string literal here. */
+static void seed_file_from_host(const char *host_path, const char *fs_name) {
+    FILE *f = fopen(host_path, "rb");
+    if (!f) {
+        fprintf(stderr, "mkfs_tinyfs: cannot open seed file %s\n", host_path);
+        exit(1);
+    }
+    char buf[TINYFS_MAX_FILE_SIZE];
+    size_t n = fread(buf, 1, sizeof(buf), f);
+    fclose(f);
+
+    tinyfs_create(fs_name);
+    tinyfs_write(fs_name, buf, (uint32_t)n);
+}
+
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <disk-image>\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <disk-image> [host-path:fs-name ...]\n", argv[0]);
         return 1;
     }
 
@@ -51,6 +68,24 @@ int main(int argc, char **argv) {
     tinyfs_format();
 
     seed_file("hello.txt", "Hello, tinyfs!\n");
+
+    for (int i = 2; i < argc; i++) {
+        char spec[256];
+        size_t speclen = strlen(argv[i]);
+        if (speclen >= sizeof(spec)) {
+            fprintf(stderr, "mkfs_tinyfs: seed spec too long: %s\n", argv[i]);
+            return 1;
+        }
+        memcpy(spec, argv[i], speclen + 1);
+
+        char *sep = strchr(spec, ':');
+        if (!sep) {
+            fprintf(stderr, "mkfs_tinyfs: bad seed spec %s (want host-path:fs-name)\n", argv[i]);
+            return 1;
+        }
+        *sep = '\0';
+        seed_file_from_host(spec, sep + 1);
+    }
 
     fclose(disk);
     printf("mkfs_tinyfs: formatted %s (%u data blocks available)\n",

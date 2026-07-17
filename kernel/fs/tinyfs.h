@@ -13,7 +13,7 @@
 /* Disk layout constants. TINYFS_DISK_SECTORS must match the disk image
  * size the Makefile builds (DISK_SECTORS). */
 #define TINYFS_DISK_SECTORS 4096
-#define TINYFS_FS_START_LBA 128 /* leaves 64KB for boot sector + kernel */
+#define TINYFS_FS_START_LBA 640 /* leaves room for boot sector + a 256KB kernel budget */
 
 #define TINYFS_NUM_INODES    64
 #define TINYFS_NAME_MAX      27 /* 26 chars + NUL */

@@ -1,0 +1,18 @@
+print("hello from tinyfs script");
+
+x = 2 + 3 * 4;
+print("x =", x);
+
+func add(a, b) {
+    return a + b;
+}
+print("add(3,4) =", add(3, 4));
+
+i = 0;
+while (i < 3) {
+    print("loop", i);
+    i = i + 1;
+}
+
+fwrite("script_out.txt", "written by script");
+print(fread("script_out.txt"));

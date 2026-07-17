@@ -51,6 +51,17 @@ type_line() {
     python3 tools/qemu_type.py "$MON" "$1"$'\n'
 }
 
+# Checks that every non-blank line in tests/expected/<fixture> appears
+# (in order) somewhere in the serial log - used for .tsh/.tc fixtures run
+# through the shell's `run`/`build`+`exec` commands.
+check_fixture_output() {
+    local expected_file="$1"
+    while IFS= read -r want; do
+        [ -z "$want" ] && continue
+        wait_for "$want" 30
+    done < "$expected_file"
+}
+
 for i in $(seq 1 25); do
     [ -S "$MON" ] && break
     sleep 0.2
@@ -80,5 +91,8 @@ wait_for "cat: no such file"
 
 type_line "help"
 wait_for "commands:"
+
+type_line "run hello.tsh"
+check_fixture_output tests/expected/hello.tsh.txt
 
 echo "run_tests: PASS"
