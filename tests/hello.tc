@@ -1,0 +1,23 @@
+x = 2 + 3 * 4;
+print(x);
+
+func add(a, b) {
+    return a + b;
+}
+print(add(3, 4));
+
+func fib(n) {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+print(fib(10));
+
+i = 0;
+sum = 0;
+while (i < 5) {
+    sum = sum + i;
+    i = i + 1;
+}
+print(sum);

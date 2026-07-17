@@ -25,7 +25,9 @@ KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c kernel/gdt.c \
                  kernel/ata.c kernel/fs/tinyfs.c kernel/fs/tinyfs_disk.c \
                  kernel/keyboard.c kernel/shell/shell.c \
                  kernel/lang/lexer.c kernel/lang/script/ast.c \
-                 kernel/lang/script/parser.c kernel/lang/script/eval.c
+                 kernel/lang/script/parser.c kernel/lang/script/eval.c \
+                 kernel/lang/compiler/parser.c kernel/lang/compiler/codegen.c \
+                 kernel/lang/vm.c
 KERNEL_ASM_SRCS := kernel/entry.S kernel/idt_stubs.S
 KERNEL_OBJS   := $(patsubst kernel/%.S,$(BUILD)/%.o,$(KERNEL_ASM_SRCS)) \
                  $(patsubst kernel/%.c,$(BUILD)/%.o,$(KERNEL_C_SRCS))
@@ -36,14 +38,14 @@ MKFS_BIN := $(BUILD)/mkfs_tinyfs
 MKFS_OBJS := $(BUILD)/host_tinyfs.o $(BUILD)/host_mkfs_tinyfs.o
 # host-path:fs-name pairs seeded into every disk image; the host paths
 # alone are listed separately so they can be used as make prerequisites
-MKFS_SEED_FILES := tests/hello.tsh
-MKFS_SEED_SPECS := tests/hello.tsh:hello.tsh
+MKFS_SEED_FILES := tests/hello.tsh tests/hello.tc
+MKFS_SEED_SPECS := tests/hello.tsh:hello.tsh tests/hello.tc:hello.tc
 
 .PHONY: all run clean
 
 all: $(DISK_IMG)
 
-BUILD_SUBDIRS := $(BUILD) $(BUILD)/fs $(BUILD)/shell $(BUILD)/lang $(BUILD)/lang/script
+BUILD_SUBDIRS := $(BUILD) $(BUILD)/fs $(BUILD)/shell $(BUILD)/lang $(BUILD)/lang/script $(BUILD)/lang/compiler
 
 $(BUILD_SUBDIRS):
 	mkdir -p $@

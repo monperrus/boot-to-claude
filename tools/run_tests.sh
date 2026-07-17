@@ -95,4 +95,10 @@ wait_for "commands:"
 type_line "run hello.tsh"
 check_fixture_output tests/expected/hello.tsh.txt
 
+type_line "build hello.tc hello.tbc"
+wait_for "build: ok"
+
+type_line "exec hello.tbc"
+check_fixture_output tests/expected/hello.tc.txt
+
 echo "run_tests: PASS"

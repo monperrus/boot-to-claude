@@ -5,7 +5,10 @@
 #include "console.h"
 #include "fs/tinyfs.h"
 #include "keyboard.h"
+#include "lang/compiler/codegen.h"
+#include "lang/compiler/parser.h"
 #include "lang/script/eval.h"
+#include "lang/vm.h"
 #include "serial.h"
 #include "string.h"
 
@@ -72,7 +75,8 @@ static int next_word(const char **p, char *out, int max_len) {
 }
 
 static void cmd_help(void) {
-    print_line("commands: ls, cat <file>, write <file> <text>, rm <file>, run <file>, help, clear, reboot");
+    print_line("commands: ls, cat <file>, write <file> <text>, rm <file>, run <file>,");
+    print_line("          build <src> <out>, exec <file>, help, clear, reboot");
 }
 
 static void cmd_ls(void) {
@@ -130,6 +134,59 @@ static void cmd_run(const char *name) {
     }
     buf[len] = '\0';
     script_run(buf);
+}
+
+static void cmd_build(const char *src_name, const char *out_name) {
+    static char src[TINYFS_MAX_FILE_SIZE + 1];
+    uint32_t src_len = 0;
+    if (tinyfs_read(src_name, src, sizeof(src) - 1, &src_len) != 0) {
+        print_line("build: no such file");
+        return;
+    }
+    src[src_len] = '\0';
+
+    tc_parser_t p;
+    tc_parser_init(&p, src);
+    ast_node_t *prog = tc_parse_program(&p);
+    if (p.error) {
+        console_write("build: parse error: ");
+        console_write(p.error_msg);
+        console_write("\n");
+        serial_write("build: parse error: ");
+        serial_write(p.error_msg);
+        serial_write("\n");
+        return;
+    }
+
+    static uint8_t out_buf[TINYFS_MAX_FILE_SIZE];
+    uint32_t out_len = 0;
+    char err[64];
+    if (codegen_compile(prog, out_buf, sizeof(out_buf), &out_len, err, sizeof(err)) != 0) {
+        console_write("build: compile error: ");
+        console_write(err);
+        console_write("\n");
+        serial_write("build: compile error: ");
+        serial_write(err);
+        serial_write("\n");
+        return;
+    }
+
+    tinyfs_create(out_name);
+    if (tinyfs_write(out_name, out_buf, out_len) != 0) {
+        print_line("build: failed to write output file");
+        return;
+    }
+    print_line("build: ok");
+}
+
+static void cmd_exec(const char *name) {
+    static uint8_t buf[TINYFS_MAX_FILE_SIZE];
+    uint32_t len = 0;
+    if (tinyfs_read(name, buf, sizeof(buf), &len) != 0) {
+        print_line("exec: no such file");
+        return;
+    }
+    vm_run(buf, len);
 }
 
 static void cmd_rm(const char *name) {
@@ -204,6 +261,22 @@ void shell_run(void) {
             } else {
                 skip_spaces(&p);
                 cmd_write(name, p);
+            }
+        } else if (strcmp(cmd, "build") == 0) {
+            char src_name[TINYFS_NAME_MAX];
+            char out_name[TINYFS_NAME_MAX];
+            if (next_word(&p, src_name, sizeof(src_name)) == 0 ||
+                next_word(&p, out_name, sizeof(out_name)) == 0) {
+                print_line("usage: build <src> <out>");
+            } else {
+                cmd_build(src_name, out_name);
+            }
+        } else if (strcmp(cmd, "exec") == 0) {
+            char name[TINYFS_NAME_MAX];
+            if (next_word(&p, name, sizeof(name)) == 0) {
+                print_line("usage: exec <file>");
+            } else {
+                cmd_exec(name);
             }
         } else {
             print_line("unknown command (type 'help')");
