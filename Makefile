@@ -5,7 +5,7 @@ OBJCOPY := objcopy
 QEMU    := qemu-system-i386
 BUILD   := build
 
-CFLAGS  := -m32 -ffreestanding -fno-pic -fno-stack-protector -nostdlib \
+CFLAGS  := -m32 -ffreestanding -fno-pic -fno-stack-protector -fno-builtin -nostdlib \
            -Wall -Wextra -O2 -std=c11 -Ikernel
 LDFLAGS := -m elf_i386 -T kernel/link.ld -nostdlib
 
@@ -13,8 +13,11 @@ BOOT_BIN   := $(BUILD)/boot.bin
 STAGE2_BIN := $(BUILD)/stage2.bin
 DISK_IMG   := $(BUILD)/disk.img
 
-KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c
-KERNEL_OBJS   := $(BUILD)/entry.o $(patsubst kernel/%.c,$(BUILD)/%.o,$(KERNEL_C_SRCS))
+KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c kernel/gdt.c \
+                 kernel/idt.c kernel/string.c kernel/memory.c kernel/selftest.c
+KERNEL_ASM_SRCS := kernel/entry.S kernel/idt_stubs.S
+KERNEL_OBJS   := $(patsubst kernel/%.S,$(BUILD)/%.o,$(KERNEL_ASM_SRCS)) \
+                 $(patsubst kernel/%.c,$(BUILD)/%.o,$(KERNEL_C_SRCS))
 KERNEL_ELF    := $(BUILD)/kernel.elf
 KERNEL_BIN    := $(BUILD)/kernel.bin
 
@@ -31,7 +34,7 @@ $(BOOT_BIN): boot/boot.S | $(BUILD)
 $(STAGE2_BIN): boot/stage2.S | $(BUILD)
 	$(AS) -f bin -o $@ $<
 
-$(BUILD)/entry.o: kernel/entry.S | $(BUILD)
+$(BUILD)/%.o: kernel/%.S | $(BUILD)
 	$(AS) -f elf32 -o $@ $<
 
 $(BUILD)/%.o: kernel/%.c | $(BUILD)
