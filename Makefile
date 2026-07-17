@@ -20,7 +20,8 @@ DISK_IMG   := $(BUILD)/disk.img
 
 KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c kernel/gdt.c \
                  kernel/idt.c kernel/string.c kernel/memory.c kernel/selftest.c \
-                 kernel/ata.c kernel/fs/tinyfs.c kernel/fs/tinyfs_disk.c
+                 kernel/ata.c kernel/fs/tinyfs.c kernel/fs/tinyfs_disk.c \
+                 kernel/keyboard.c kernel/shell/shell.c
 KERNEL_ASM_SRCS := kernel/entry.S kernel/idt_stubs.S
 KERNEL_OBJS   := $(patsubst kernel/%.S,$(BUILD)/%.o,$(KERNEL_ASM_SRCS)) \
                  $(patsubst kernel/%.c,$(BUILD)/%.o,$(KERNEL_C_SRCS))
@@ -34,7 +35,7 @@ MKFS_OBJS := $(BUILD)/host_tinyfs.o $(BUILD)/host_mkfs_tinyfs.o
 
 all: $(DISK_IMG)
 
-$(BUILD) $(BUILD)/fs:
+$(BUILD) $(BUILD)/fs $(BUILD)/shell:
 	mkdir -p $@
 
 $(BOOT_BIN): boot/boot.S | $(BUILD)
@@ -43,10 +44,10 @@ $(BOOT_BIN): boot/boot.S | $(BUILD)
 $(STAGE2_BIN): boot/stage2.S | $(BUILD)
 	$(AS) -f bin -o $@ $<
 
-$(BUILD)/%.o: kernel/%.S | $(BUILD) $(BUILD)/fs
+$(BUILD)/%.o: kernel/%.S | $(BUILD) $(BUILD)/fs $(BUILD)/shell
 	$(AS) -f elf32 -o $@ $<
 
-$(BUILD)/%.o: kernel/%.c | $(BUILD) $(BUILD)/fs
+$(BUILD)/%.o: kernel/%.c | $(BUILD) $(BUILD)/fs $(BUILD)/shell
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(KERNEL_ELF): $(KERNEL_OBJS) kernel/link.ld

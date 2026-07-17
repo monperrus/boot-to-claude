@@ -1,23 +1,84 @@
 #!/usr/bin/env bash
-# Boots the kernel headlessly in QEMU and checks the serial output for the
-# self-test oracle. Later phases extend this with fixture-based checks
-# (tests/*.tsh, tests/*.tc against tests/expected/*.txt).
+# Boots the kernel headlessly in QEMU, checks the kernel self-test result,
+# then drives the interactive shell via QEMU's monitor `sendkey` (see
+# tools/qemu_type.py - there's no other way to feed the polled PS/2
+# keyboard driver without real hardware) and asserts on serial output.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-
 make >/dev/null
 
-OUTPUT=$(timeout 5 qemu-system-i386 \
-    -drive file=build/disk.img,format=raw \
-    -display none -serial stdio -no-reboot 2>&1 || true)
+BUILD=build
+LOG="$BUILD/serial.log"
+MON="$BUILD/qemu-monitor.sock"
+rm -f "$LOG" "$MON"
 
-echo "$OUTPUT"
+qemu-system-i386 \
+    -drive file="$BUILD/disk.img",format=raw \
+    -display none \
+    -serial file:"$LOG" \
+    -monitor unix:"$MON",server,nowait \
+    -no-reboot &
+QEMU_PID=$!
 
-if echo "$OUTPUT" | grep -q "SELFTEST PASS"; then
-    echo "run_tests: PASS"
-    exit 0
-else
-    echo "run_tests: FAIL"
+cleanup() {
+    kill "$QEMU_PID" 2>/dev/null || true
+    wait "$QEMU_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+fail() {
+    echo "run_tests: FAIL - $1"
+    echo "--- serial log ---"
+    cat "$LOG" 2>/dev/null || true
     exit 1
-fi
+}
+
+wait_for() {
+    local pattern="$1"
+    local max_tries="${2:-50}" # 50 * 0.2s = 10s
+    local i=0
+    while ! grep -qF "$pattern" "$LOG" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge "$max_tries" ]; then
+            fail "timed out waiting for '$pattern'"
+        fi
+        sleep 0.2
+    done
+}
+
+type_line() {
+    python3 tools/qemu_type.py "$MON" "$1"$'\n'
+}
+
+for i in $(seq 1 25); do
+    [ -S "$MON" ] && break
+    sleep 0.2
+done
+[ -S "$MON" ] || fail "qemu monitor socket never appeared"
+
+wait_for "SELFTEST PASS"
+wait_for "type 'help'"
+
+type_line "ls"
+wait_for "hello.txt"
+
+type_line "cat hello.txt"
+wait_for "Hello, tinyfs!"
+
+type_line "write greet.txt hi there"
+wait_for "write: ok"
+
+type_line "cat greet.txt"
+wait_for "hi there"
+
+type_line "rm greet.txt"
+wait_for "rm: ok"
+
+type_line "cat greet.txt"
+wait_for "cat: no such file"
+
+type_line "help"
+wait_for "commands:"
+
+echo "run_tests: PASS"

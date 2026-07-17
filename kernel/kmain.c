@@ -5,6 +5,7 @@
 #include "memory.h"
 #include "selftest.h"
 #include "serial.h"
+#include "shell/shell.h"
 
 void kmain(void) {
     serial_init();
@@ -24,7 +25,5 @@ void kmain(void) {
 
     selftest_run();
 
-    for (;;) {
-        __asm__ volatile ("hlt");
-    }
+    shell_run();
 }

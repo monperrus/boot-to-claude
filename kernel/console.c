@@ -35,6 +35,13 @@ void console_putc(char c) {
     if (c == '\n') {
         cursor_col = 0;
         cursor_row++;
+    } else if (c == '\b') {
+        if (cursor_col > 0) {
+            cursor_col--;
+        } else if (cursor_row > 0) {
+            cursor_row--;
+            cursor_col = VGA_COLS - 1;
+        }
     } else {
         VGA_MEM[cursor_row * VGA_COLS + cursor_col] = (uint16_t)((VGA_ATTR << 8) | (uint8_t)c);
         cursor_col++;
