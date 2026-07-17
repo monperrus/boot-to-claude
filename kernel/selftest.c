@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "console.h"
+#include "fs/tinyfs.h"
 #include "memory.h"
 #include "serial.h"
 #include "string.h"
@@ -68,6 +69,40 @@ static void test_memory(void) {
     kfree(c);
 }
 
+static void test_fs(void) {
+    tinyfs_dirent_t entries[TINYFS_NUM_INODES];
+    int n = tinyfs_list(entries, TINYFS_NUM_INODES);
+    check(n >= 1, "tinyfs_list finds seeded files");
+
+    int found = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(entries[i].name, "hello.txt") == 0) {
+            found = 1;
+        }
+    }
+    check(found, "tinyfs_list contains hello.txt");
+
+    char buf[64];
+    uint32_t len = 0;
+    int rc = tinyfs_read("hello.txt", buf, sizeof(buf) - 1, &len);
+    check(rc == 0, "tinyfs_read hello.txt succeeds");
+    if (rc == 0) {
+        buf[len] = '\0';
+        check(strcmp(buf, "Hello, tinyfs!\n") == 0, "hello.txt content matches");
+    }
+
+    check(tinyfs_create("selftest.tmp") == 0, "tinyfs_create new file");
+    check(tinyfs_write("selftest.tmp", "abc123", 6) == 0, "tinyfs_write new file");
+    len = 0;
+    rc = tinyfs_read("selftest.tmp", buf, sizeof(buf) - 1, &len);
+    check(rc == 0 && len == 6, "tinyfs_read roundtrip length");
+    if (rc == 0) {
+        buf[len] = '\0';
+        check(strcmp(buf, "abc123") == 0, "tinyfs_read roundtrip content");
+    }
+    check(tinyfs_delete("selftest.tmp") == 0, "tinyfs_delete");
+}
+
 int selftest_run(void) {
     ok = 1;
     console_write("selftest: running\n");
@@ -75,6 +110,7 @@ int selftest_run(void) {
 
     test_string();
     test_memory();
+    test_fs();
 
     if (ok) {
         console_write("SELFTEST PASS\n");

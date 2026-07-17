@@ -1,4 +1,5 @@
 #include "console.h"
+#include "fs/tinyfs_disk.h"
 #include "gdt.h"
 #include "idt.h"
 #include "memory.h"
@@ -15,6 +16,11 @@ void kmain(void) {
 
     console_write("tiny-os: kernel entered\n");
     serial_write("tiny-os: kernel entered\n");
+
+    if (tinyfs_disk_init() != 0) {
+        console_write("tinyfs: mount FAILED\n");
+        serial_write("tinyfs: mount FAILED\n");
+    }
 
     selftest_run();
 

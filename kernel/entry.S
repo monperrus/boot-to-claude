@@ -7,9 +7,21 @@ BITS 32
 section .text.entry
 global _start
 extern kmain
+extern _bss_start
+extern _bss_end
 
 _start:
     mov esp, stack_top
+
+    ; Zero .bss: the raw disk-loaded kernel image has no zero-fill
+    ; guarantee (objcopy -O binary drops NOBITS sections entirely).
+    mov edi, _bss_start
+    mov ecx, _bss_end
+    sub ecx, edi
+    xor eax, eax
+    cld
+    rep stosb
+
     call kmain
 .hang:
     hlt
