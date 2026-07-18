@@ -112,6 +112,7 @@ int main(int argc, char **argv) {
     int n_inputs = 0;
     int flat_mode = 0;
     uint32_t flat_base = 0x10000;
+    int flat_format_bin = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) { outpath = argv[++i]; }
@@ -126,13 +127,20 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--flat-base") == 0 && i + 1 < argc) {
             flat_base = (uint32_t)strtoul(argv[++i], NULL, 0);
         }
+        else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            /* flat mode only - write the loadable bytes directly instead
+             * of wrapping them in an ELF (no separate OBJCOPY step, see
+             * ld.h/docs/toolchain.md). Default stays ELF: still useful
+             * to inspect with nm/objdump while debugging. */
+            flat_format_bin = strcmp(argv[++i], "bin") == 0;
+        }
         else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) { i++; /* -m elf_i386: accepted, always true */ }
         else if (strcmp(argv[i], "-nostdlib") == 0) { /* accepted, always true - no libc ever linked */ }
         else if (argv[i][0] == '-') { fprintf(stderr, "ld: unrecognized option '%s'\n", argv[i]); return 1; }
         else { if (n_inputs < MAX_INPUT_FILES) inputs[n_inputs++] = argv[i]; }
     }
     if (!outpath || n_inputs == 0) {
-        fprintf(stderr, "usage: ld [-T <script>] [--flat-base 0xADDR] -o <out> <in.o>...\n");
+        fprintf(stderr, "usage: ld [-T <script>] [--flat-base 0xADDR] [--format elf|bin] -o <out> <in.o>...\n");
         return 1;
     }
 
@@ -154,6 +162,11 @@ int main(int argc, char **argv) {
     build_global_symbol_table(&ctx);
     apply_relocations(&ctx);
 
-    int rc = flat_mode ? write_flat_elf(&ctx, outpath, flat_base) : write_static_exec_elf(&ctx, outpath);
+    int rc;
+    if (flat_mode) {
+        rc = flat_format_bin ? write_flat_bin(&ctx, outpath) : write_flat_elf(&ctx, outpath, flat_base);
+    } else {
+        rc = write_static_exec_elf(&ctx, outpath);
+    }
     return rc == 0 ? 0 : 1;
 }

@@ -32,6 +32,33 @@ void flat_assign_addresses(link_ctx_t *ctx, uint32_t base) {
     s2->defined = 1;
 }
 
+/* Flat binary output: the loadable sections' bytes, concatenated in
+ * address order with zero-padding for any inter-section alignment gap
+ * (align4 in flat_assign_addresses) - what the bootloader actually reads
+ * off disk and jumps into directly, no ELF involved. Replaces the
+ * ELF-then-`objcopy -O binary` two-step (see docs/toolchain.md): this is
+ * strictly simpler, since flat_assign_addresses already computed exactly
+ * this layout in memory before write_flat_elf below wraps it in headers.
+ * .bss is omitted, same as objcopy would (SHT_NOBITS has no file
+ * content) - entry.S zeroes it itself via _bss_start/_bss_end. */
+int write_flat_bin(link_ctx_t *ctx, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) { perror("ld: fopen"); return -1; }
+
+    static const sec_kind_t order[] = { SEC_TEXT, SEC_RODATA, SEC_DATA };
+    uint32_t cur = ctx->merged_addr[SEC_TEXT];
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+        sec_kind_t k = order[i];
+        if (ctx->merged_size[k] == 0) continue;
+        while (cur < ctx->merged_addr[k]) { fputc(0, f); cur++; }
+        fwrite(ctx->merged_data[k], 1, ctx->merged_size[k], f);
+        cur += ctx->merged_size[k];
+    }
+
+    fclose(f);
+    return 0;
+}
+
 typedef struct {
     char buf[1 << 16];
     uint32_t len;

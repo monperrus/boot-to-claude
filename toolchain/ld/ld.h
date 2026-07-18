@@ -4,13 +4,17 @@
  *
  * Two output modes, both sharing the same merge/resolve/relocate core
  * (main.c): `link_flat` (kernel/link.ld's single-load-address layout -
- * .text/.rodata/.data/.bss concatenated at a fixed base, for OBJCOPY to
- * turn into a flat kernel image) and `link_static_exec` (a minimal
- * static ELF32 executable the Linux kernel can run directly, for host
- * tools - one PT_LOAD segment, no dynamic linking). Neither mode
- * implements a general linker-script language: `link_flat`'s layout is
- * hardcoded to match kernel/link.ld exactly (see link_flat.c), since
- * that is the only layout this project's kernel ever needs. */
+ * .text/.rodata/.data/.bss concatenated at a fixed base; can write
+ * either a flat binary the bootloader reads directly, or an ELF for
+ * inspection - see write_flat_bin/write_flat_elf) and `link_static_exec`
+ * (a minimal static ELF32 executable the Linux kernel can run directly,
+ * for host tools - one PT_LOAD segment, no dynamic linking). Neither
+ * mode implements a general linker-script language: `link_flat`'s layout
+ * is hardcoded to match kernel/link.ld exactly (see link_flat.c), since
+ * that is the only layout this project's kernel ever needs. There is no
+ * separate OBJCOPY tool: link_flat already has the loadable bytes laid
+ * out in memory before write_flat_elf wraps them in ELF headers, so
+ * write_flat_bin just writes that same layout straight to a file. */
 
 #include <stdint.h>
 #include <stddef.h>
@@ -102,6 +106,7 @@ out_symbol_t *find_out_sym(link_ctx_t *ctx, const char *name);
  * main.c, since both need final addresses) and a writer (called after). */
 void flat_assign_addresses(link_ctx_t *ctx, uint32_t base);
 int write_flat_elf(link_ctx_t *ctx, const char *path, uint32_t base);
+int write_flat_bin(link_ctx_t *ctx, const char *path);
 
 void static_exec_assign_addresses(link_ctx_t *ctx);
 int write_static_exec_elf(link_ctx_t *ctx, const char *path);

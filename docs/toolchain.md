@@ -317,8 +317,17 @@ Two output modes, sharing the merge/resolve/relocate core above:
 - `link_flat` (`-T <script>`, script contents never read - its mere
   presence is the mode switch): hardcodes `kernel/link.ld`'s exact
   layout, base `0x10000`, `.text`/`.rodata`/`.data`/`.bss` 4-byte-aligned
-  in sequence, injects `_bss_start`/`_bss_end`. Produces an `ET_EXEC`
-  with real section headers for `objcopy -O binary` to extract.
+  in sequence, injects `_bss_start`/`_bss_end`. Two writers share this
+  layout: `write_flat_elf` produces an `ET_EXEC` with real section
+  headers (useful for `nm`/`objdump` while debugging), and
+  `write_flat_bin` (`--format bin`) writes the same loadable bytes
+  straight to a file with no ELF wrapper at all - what the bootloader
+  actually reads off disk. There is no separate OBJCOPY tool: LD already
+  has the bytes laid out in memory before write_flat_elf wraps them in
+  headers, so write_flat_bin is a direct writer, not an ELF-parsing
+  extractor. Verified byte-identical to `write_flat_elf`'s output piped
+  through GNU `objcopy -O binary`, and separately boot-tested to
+  `SELFTEST PASS`.
 - `link_static_exec` (default): a minimal real Linux ET_EXEC for host
   tools - base `0x08048000`, one RWX `PT_LOAD` segment covering the
   whole file, `.bss` covered only by `p_memsz > p_filesz`, **no section
@@ -338,7 +347,7 @@ booted in QEMU to `SELFTEST PASS` and a working interactive shell
 then actually run to format a real disk image, which then boots and
 passes the full `tools/run_tests.sh` suite.
 
-That last check surfaced five real, previously-latent bugs - none of them
+That last check surfaced seven real, previously-latent bugs - none of them
 in LD itself, but in CC/AS paths LD's static_exec mode was the first
 thing to actually exercise end-to-end:
 
@@ -410,11 +419,6 @@ thing to actually exercise end-to-end:
   `imul r32, r/m32, imm32` encoding (`0x69 /r id`, always full imm32 -
   same "no imm8 sign-extend optimization" convention the group1 ALU ops
   already use).
-
-## OBJCOPY
-
-Not yet built - Phase T6. Everything so far extracts the flat kernel
-binary with GNU `objcopy -O binary` as an interim step.
 
 ## Bootstrap
 
