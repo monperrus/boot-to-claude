@@ -365,6 +365,26 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
             e8(&e, (uint8_t)(0xC0 | (regnum(a->reg) << 3) | regnum(b->reg)));
             return e.len;
         }
+        /* mov r16, r/m16 and mov r/m16, r16 in 32-bit code - e.g.
+         * `mov ax, [eax]` / `mov [ecx], ax`, the pair CC's codegen uses
+         * for 16-bit (uint16_t/short) loads/stores via the same general
+         * register-based addressing forms encode_rm32 already handles
+         * for 32-bit operands. Only the operand-size prefix (0x66)
+         * differs from the 32-bit mov r32,r/m32 case below - the
+         * addressing byte(s) are identical either way. Distinct from the
+         * st->bits==16 bare-label forms right below, which are for
+         * 16-bit *code* (real mode), not 32-bit code touching a 16-bit
+         * operand. */
+        if (st->bits == 32 && a->kind == OPND_REG && is_reg16(a->reg) && b->kind == OPND_MEM) {
+            e8(&e, 0x66); e8(&e, 0x8B);
+            encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
+            return e.len;
+        }
+        if (st->bits == 32 && a->kind == OPND_MEM && b->kind == OPND_REG && is_reg16(b->reg)) {
+            e8(&e, 0x66); e8(&e, 0x89);
+            encode_rm32(&e, ctx, is_bin, a, regnum(b->reg), st->section, st->offset, strict);
+            return e.len;
+        }
         if (st->bits == 16 && a->kind == OPND_REG && is_reg16(a->reg) && b->kind == OPND_MEM && !b->reg) {
             e8(&e, 0x8B);
             e8(&e, (uint8_t)(0x06 | (regnum(a->reg) << 3)));
@@ -516,7 +536,17 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
     }
 
     if (strcmp(m, "movzx") == 0 && is_reg32(a->reg) && is_reg16(b->reg)) {
-        e8(&e, 0x66); e8(&e, 0x0F); e8(&e, 0xB7);
+        /* MOVZX r32, r/m16 = 0F B7 /r, no 0x66 prefix - the opcode
+         * itself already means "32-bit destination, 16-bit source"; a
+         * leading 0x66 operand-size override reinterprets *both*
+         * operands as 16-bit, silently downgrading this to r16,r16 (a
+         * near no-op) instead of actually zero-extending into the full
+         * 32-bit register. Never previously exercised: every earlier
+         * movzx use was the byte-from-memory form (0F B6) below, not
+         * this register-to-register 16-to-32 form - only CC's new
+         * TY_SHORT load path (`mov ax,[eax]` then `movzx eax,ax`) hit
+         * it, see docs/toolchain.md. */
+        e8(&e, 0x0F); e8(&e, 0xB7);
         e8(&e, (uint8_t)(0xC0 | (regnum(a->reg) << 3) | regnum(b->reg)));
         return e.len;
     }
@@ -574,11 +604,22 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
 
     if (strcmp(m, "jmp") == 0) {
         if (a->kind == OPND_FAR) {
+            /* EA ptr16:16 (16-bit operand size) or EA ptr16:32 (32-bit) -
+             * the segment selector is always 16 bits, but the offset
+             * width follows the current bit mode. Using the 16-bit form
+             * unconditionally left the far jump 2 bytes short in 32-bit
+             * code (e.g. __builtin_gdt_flush's `jmp 0x08:label`, used to
+             * reload CS after loading the GDT) - the "segment" half
+             * ended up reading the offset's missing high 16 bits
+             * instead, and the real segment bytes spilled into the next
+             * instruction, corrupting everything after it. */
             e8(&e, 0xEA);
-            int64_t off = resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, st->offset + 1, strict);
-            e16(&e, (uint16_t)off);
+            uint32_t off_patch_off = st->offset + 1;
+            int width = st->bits == 16 ? 2 : 4;
+            int64_t off = resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, off_patch_off, strict);
+            if (width == 2) e16(&e, (uint16_t)off); else e32(&e, (uint32_t)off);
             int64_t seg = a->far_seg_has_sym
-                ? resolve_abs(ctx, is_bin, a->far_seg_sym, a->far_seg, st->section, st->offset + 3, strict)
+                ? resolve_abs(ctx, is_bin, a->far_seg_sym, a->far_seg, st->section, off_patch_off + (uint32_t)width, strict)
                 : a->far_seg;
             e16(&e, (uint16_t)seg);
             return e.len;
@@ -637,18 +678,42 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
     if (strcmp(m, "in") == 0) {
         if (b->kind == OPND_IMM) { e8(&e, 0xE4); e8(&e, (uint8_t)b->disp); return e.len; }
         if (b->reg == R_DX && a->reg == R_AL) { e8(&e, 0xEC); return e.len; }
-        if (b->reg == R_DX && a->reg == R_AX) { e8(&e, 0xED); return e.len; }
+        /* IN AX,DX needs the 0x66 operand-size override - 0xED alone,
+         * in 32-bit code, means IN EAX,DX (the default operand size).
+         * Without the prefix this silently read two 16-bit words per
+         * call (packed into EAX, high half discarded by the caller's
+         * own movzx), draining twice as many words off the ATA data
+         * port as intended and dropping every other one - see
+         * kernel/ata.c / docs/toolchain.md. */
+        if (b->reg == R_DX && a->reg == R_AX) { e8(&e, 0x66); e8(&e, 0xED); return e.len; }
+        if (b->reg == R_DX && a->reg == R_EAX) { e8(&e, 0xED); return e.len; }
     }
     if (strcmp(m, "out") == 0) {
         if (a->kind == OPND_IMM) { e8(&e, 0xE6); e8(&e, (uint8_t)a->disp); return e.len; }
         if (a->reg == R_DX && b->reg == R_AL) { e8(&e, 0xEE); return e.len; }
-        if (a->reg == R_DX && b->reg == R_AX) { e8(&e, 0xEF); return e.len; }
+        if (a->reg == R_DX && b->reg == R_AX) { e8(&e, 0x66); e8(&e, 0xEF); return e.len; }
+        if (a->reg == R_DX && b->reg == R_EAX) { e8(&e, 0xEF); return e.len; }
     }
 
     if (strcmp(m, "int") == 0) { e8(&e, 0xCD); e8(&e, (uint8_t)a->disp); return e.len; }
-    if (strcmp(m, "lgdt") == 0) {
+    if (strcmp(m, "lgdt") == 0 && st->bits == 16) {
+        /* boot/stage2.S's real-mode form: a direct 16-bit absolute
+         * address, hardcoded to that one ModRM byte (mod=00, reg=2,
+         * rm=110 "disp16 direct address") - distinct from the 32-bit
+         * register-indirect form below, which CC's __builtin_gdt_flush
+         * uses instead (`lgdt [ecx]`, loading from a C variable's
+         * address held in a register). */
         e8(&e, 0x0F); e8(&e, 0x01); e8(&e, 0x16);
         e16(&e, (uint16_t)resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, st->offset + (uint32_t)e.len, strict));
+        return e.len;
+    }
+    if ((strcmp(m, "lgdt") == 0 || strcmp(m, "lidt") == 0) && st->bits == 32 &&
+        (a->kind == OPND_MEM || a->kind == OPND_REG)) {
+        /* 0F 01 /2 (lgdt) or /3 (lidt), r/m32 - general memory/register
+         * operand via the same encode_rm32 helper every other
+         * instruction here uses, e.g. `lgdt [ecx]` / `lidt [ecx]`. */
+        e8(&e, 0x0F); e8(&e, 0x01);
+        encode_rm32(&e, ctx, is_bin, a, strcmp(m, "lgdt") == 0 ? 2 : 3, st->section, st->offset, strict);
         return e.len;
     }
 

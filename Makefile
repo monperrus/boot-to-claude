@@ -1,14 +1,22 @@
-AS      := nasm
-CC      := gcc
-HOSTCC  := gcc
-LD      := ld
-OBJCOPY := objcopy
-QEMU    := qemu-system-i386
-BUILD   := build
+BUILD  := build
 
-CFLAGS  := -m32 -ffreestanding -fno-pic -fno-stack-protector -fno-builtin -nostdlib \
-           -Wall -Wextra -O2 -std=c11 -Ikernel
-LDFLAGS := -m elf_i386 -T kernel/link.ld -nostdlib
+# BOOTSTRAP_CC: the *host's* real C compiler, needed exactly once to
+# build our own AS/CC/LD from source on a fresh checkout (see
+# docs/toolchain.md's Bootstrap section). Everything below that point -
+# every kernel/host-tool source file - is built exclusively by our own
+# tools; BOOTSTRAP_CC is never invoked on OS code.
+BOOTSTRAP_CC := gcc
+
+AS     := $(BUILD)/toolchain/as
+CC     := $(BUILD)/toolchain/cc
+LD     := $(BUILD)/toolchain/ld
+HOSTCC := $(BUILD)/toolchain/cc --target=host
+QEMU   := qemu-system-i386
+
+# -Itoolchain/include: CC has no built-in header search path at all (see
+# docs/toolchain.md) - <stdint.h>/<stddef.h> only resolve because of this.
+CFLAGS  := -Ikernel -Itoolchain/include
+HOSTCFLAGS := -Ikernel -Itools -Itoolchain/include
 
 # Must match TINYFS_DISK_SECTORS / TINYFS_FS_START_LBA in kernel/fs/tinyfs.h
 # and KERNEL_START_LBA / KERNEL_SECTORS in boot/stage2.S
@@ -20,10 +28,13 @@ BOOT_BIN   := $(BUILD)/boot.bin
 STAGE2_BIN := $(BUILD)/stage2.bin
 DISK_IMG   := $(BUILD)/disk.img
 
+# kernel/builtins_shim.c is gone: CC intercepts every __builtin_* call
+# site directly in codegen (see docs/toolchain.md) and never needs a
+# linkable definition - the shim only existed for the old gcc build.
 KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c kernel/gdt.c \
                  kernel/idt.c kernel/string.c kernel/memory.c kernel/selftest.c \
                  kernel/ata.c kernel/fs/tinyfs.c kernel/fs/tinyfs_disk.c \
-                 kernel/keyboard.c kernel/shell/shell.c kernel/builtins_shim.c \
+                 kernel/keyboard.c kernel/shell/shell.c \
                  kernel/lang/lexer.c kernel/lang/script/ast.c \
                  kernel/lang/script/parser.c kernel/lang/script/eval.c \
                  kernel/lang/compiler/parser.c kernel/lang/compiler/codegen.c \
@@ -31,18 +42,17 @@ KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c kernel/gdt.c \
 KERNEL_ASM_SRCS := kernel/entry.S kernel/idt_stubs.S
 KERNEL_OBJS   := $(patsubst kernel/%.S,$(BUILD)/%.o,$(KERNEL_ASM_SRCS)) \
                  $(patsubst kernel/%.c,$(BUILD)/%.o,$(KERNEL_C_SRCS))
-KERNEL_ELF    := $(BUILD)/kernel.elf
 KERNEL_BIN    := $(BUILD)/kernel.bin
 
-HOSTCFLAGS := -m32 -Wall -Wextra -O2 -Ikernel
-
 MKFS_BIN := $(BUILD)/mkfs_tinyfs
-# host_string.o: kernel/string.c compiled natively - host tools are
-# libc-free (see docs/toolchain.md), same as the kernel itself.
-# host_syscalls_shim.o: real int 0x80 bodies for the interim GCC build
-# only, dropped once Phase T7 switches to CC (see tools/host_syscalls.h).
-MKFS_OBJS := $(BUILD)/host_tinyfs.o $(BUILD)/host_string.o \
-             $(BUILD)/host_syscalls_shim.o $(BUILD)/host_mkfs_tinyfs.o
+# host_string.o/host_tinyfs.o: kernel/string.c and kernel/fs/tinyfs.c
+# compiled a *second* time, natively - host tools are libc-free (see
+# docs/toolchain.md), same as the kernel itself, and this build has its
+# own build/fs/tinyfs.o etc for the freestanding kernel target, so these
+# need the host_ prefix to not collide with those.
+# tools/host_syscalls_shim.c is gone the same way builtins_shim.c is:
+# CC intercepts __sys_* calls directly.
+MKFS_OBJS := $(BUILD)/host_tinyfs.o $(BUILD)/host_string.o $(BUILD)/host_mkfs_tinyfs.o
 # host-path:fs-name pairs seeded into every disk image; the host paths
 # alone are listed separately so they can be used as make prerequisites
 MKFS_SEED_FILES := tests/hello.tsh tests/hello.tc
@@ -52,28 +62,57 @@ MKFS_SEED_SPECS := tests/hello.tsh:hello.tsh tests/hello.tc:hello.tc
 
 all: $(DISK_IMG)
 
-BUILD_SUBDIRS := $(BUILD) $(BUILD)/fs $(BUILD)/shell $(BUILD)/lang $(BUILD)/lang/script $(BUILD)/lang/compiler
+BUILD_SUBDIRS := $(BUILD) $(BUILD)/toolchain $(BUILD)/fs $(BUILD)/shell \
+                  $(BUILD)/lang $(BUILD)/lang/script $(BUILD)/lang/compiler
 
 $(BUILD_SUBDIRS):
 	mkdir -p $@
 
-$(BOOT_BIN): boot/boot.S | $(BUILD)
+# --- bootstrap: build our own AS/CC/LD from source, once, with the host's gcc ---
+
+TOOLCHAIN_AS_SRCS := $(wildcard toolchain/as/*.c)
+TOOLCHAIN_CC_SRCS := $(wildcard toolchain/cc/*.c)
+TOOLCHAIN_LD_SRCS := $(wildcard toolchain/ld/*.c)
+
+$(BUILD)/toolchain/as: $(TOOLCHAIN_AS_SRCS) | $(BUILD)/toolchain
+	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -o $@ $(TOOLCHAIN_AS_SRCS)
+
+$(BUILD)/toolchain/cc: $(TOOLCHAIN_CC_SRCS) | $(BUILD)/toolchain
+	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -o $@ $(TOOLCHAIN_CC_SRCS)
+
+$(BUILD)/toolchain/ld: $(TOOLCHAIN_LD_SRCS) | $(BUILD)/toolchain
+	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -o $@ $(TOOLCHAIN_LD_SRCS)
+
+# --- boot loader (hand-written assembly, flat binary) ---
+
+$(BOOT_BIN): boot/boot.S | $(BUILD) $(AS)
 	$(AS) -f bin -o $@ $<
 
-$(STAGE2_BIN): boot/stage2.S | $(BUILD)
+$(STAGE2_BIN): boot/stage2.S | $(BUILD) $(AS)
 	$(AS) -f bin -o $@ $<
 
-$(BUILD)/%.o: kernel/%.S | $(BUILD_SUBDIRS)
+# --- kernel ---
+# Hand-written assembly (entry.S/idt_stubs.S) assembles directly.
+# C sources go through CC first (.c -> .S, AS-syntax text) and then AS
+# (.S -> .o, ELF32 relocatable) - CC has no built-in assembler, it always
+# emits assembly text (see docs/toolchain.md), so this is always two
+# steps where gcc's `-c` used to be one.
+
+$(BUILD)/%.o: kernel/%.S | $(BUILD_SUBDIRS) $(AS)
 	$(AS) -f elf32 -o $@ $<
 
-$(BUILD)/%.o: kernel/%.c | $(BUILD_SUBDIRS)
-	$(CC) $(CFLAGS) -c -o $@ $<
+$(BUILD)/%.S: kernel/%.c | $(BUILD_SUBDIRS) $(CC)
+	$(CC) $(CFLAGS) -o $@ $<
 
-$(KERNEL_ELF): $(KERNEL_OBJS) kernel/link.ld
-	$(LD) $(LDFLAGS) -o $@ $(KERNEL_OBJS)
+$(BUILD)/%.o: $(BUILD)/%.S | $(BUILD_SUBDIRS) $(AS)
+	$(AS) -f elf32 -o $@ $<
 
-$(KERNEL_BIN): $(KERNEL_ELF)
-	$(OBJCOPY) -O binary $< $@
+# LD's link_flat mode writes the kernel image straight to a flat binary
+# (--format bin) - no intermediate ELF, no OBJCOPY step (see
+# docs/toolchain.md: LD already has the loadable bytes laid out in
+# memory before an ELF wrapper would even be needed).
+$(KERNEL_BIN): $(KERNEL_OBJS) kernel/link.ld | $(LD)
+	$(LD) -T kernel/link.ld --format bin -o $@ $(KERNEL_OBJS)
 	@size=$$(stat -c%s $@); budget=$$(( $(KERNEL_MAX_SECTORS) * 512 )); \
 	if [ "$$size" -gt "$$budget" ]; then \
 		echo "error: $@ is $$size bytes, exceeds the $$budget-byte ($(KERNEL_MAX_SECTORS)-sector) boot budget" >&2; \
@@ -82,24 +121,29 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 	fi
 
 # --- host-side mkfs tool (build-time infrastructure, not kernel code) ---
-# -m32: matches CC's x86-32-only codegen, so tools/host_syscalls_shim.c's
-# int 0x80 convention is correct and this build stays consistent with
-# what Phase T7 will produce.
+# Same two-step (.c -> .S -> .o) pipeline as the kernel, via HOSTCC
+# (CC --target=host, which adds a _start that calls main - see
+# docs/toolchain.md) instead of CC.
 
-$(BUILD)/host_tinyfs.o: kernel/fs/tinyfs.c | $(BUILD)
-	$(HOSTCC) $(HOSTCFLAGS) -c -o $@ $<
+$(BUILD)/host_tinyfs.S: kernel/fs/tinyfs.c | $(BUILD) $(CC)
+	$(HOSTCC) $(HOSTCFLAGS) -o $@ $<
+$(BUILD)/host_tinyfs.o: $(BUILD)/host_tinyfs.S | $(BUILD) $(AS)
+	$(AS) -f elf32 -o $@ $<
 
-$(BUILD)/host_string.o: kernel/string.c | $(BUILD)
-	$(HOSTCC) $(HOSTCFLAGS) -c -o $@ $<
+$(BUILD)/host_string.S: kernel/string.c | $(BUILD) $(CC)
+	$(HOSTCC) $(HOSTCFLAGS) -o $@ $<
+$(BUILD)/host_string.o: $(BUILD)/host_string.S | $(BUILD) $(AS)
+	$(AS) -f elf32 -o $@ $<
 
-$(BUILD)/host_syscalls_shim.o: tools/host_syscalls_shim.c | $(BUILD)
-	$(HOSTCC) $(HOSTCFLAGS) -c -o $@ $<
+$(BUILD)/host_mkfs_tinyfs.S: tools/mkfs_tinyfs.c | $(BUILD) $(CC)
+	$(HOSTCC) $(HOSTCFLAGS) -o $@ $<
+$(BUILD)/host_mkfs_tinyfs.o: $(BUILD)/host_mkfs_tinyfs.S | $(BUILD) $(AS)
+	$(AS) -f elf32 -o $@ $<
 
-$(BUILD)/host_mkfs_tinyfs.o: tools/mkfs_tinyfs.c | $(BUILD)
-	$(HOSTCC) $(HOSTCFLAGS) -c -o $@ $<
-
-$(MKFS_BIN): $(MKFS_OBJS)
-	$(HOSTCC) -m32 -o $@ $(MKFS_OBJS)
+# LD's default (link_static_exec) mode: a minimal static ELF32 executable,
+# entry point taken from the linked _start symbol (see docs/toolchain.md).
+$(MKFS_BIN): $(MKFS_OBJS) | $(LD)
+	$(LD) -o $@ $(MKFS_OBJS)
 
 $(DISK_IMG): $(BOOT_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(MKFS_BIN) $(MKFS_SEED_FILES)
 	dd if=/dev/zero of=$@ bs=512 count=$(DISK_SECTORS) status=none

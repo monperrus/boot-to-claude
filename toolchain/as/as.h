@@ -15,9 +15,12 @@ static inline void safe_strcpy(char *dst, const char *src, size_t dstsize) {
     dst[i] = '\0';
 }
 
-#define MAX_SYMS 512
-#define MAX_STMTS 4096
-#define MAX_RELOCS 256
+/* Generous fixed limits - struct-by-value codegen (each copy/return/
+ * argument expands into a whole compare-and-loop, see docs/toolchain.md)
+ * pushed kernel/lang/script/eval.c well past the old, tighter numbers. */
+#define MAX_SYMS 4096
+#define MAX_STMTS 32768
+#define MAX_RELOCS 4096
 #define MAX_LINE 512
 #define MAX_NAME 64
 #define MAX_SECTIONS 8

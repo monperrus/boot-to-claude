@@ -420,6 +420,182 @@ thing to actually exercise end-to-end:
   same "no imm8 sign-extend optimization" convention the group1 ALU ops
   already use).
 
+## Full switch-over (Phase T7)
+
+The Makefile now builds `toolchain/{as,cc,ld}` from source with the
+host's real `gcc` (`BOOTSTRAP_CC`, invoked exactly once, only on that
+source - see `docs/toolchain.md`'s Bootstrap section below), then uses
+those binaries for every kernel and host-tool source file. `AS`/`CC`/`LD`
+point at `$(BUILD)/toolchain/{as,cc,ld}`; `HOSTCC` is `CC --target=host`.
+Since CC never emits object files directly (only AS-syntax assembly
+text), every C source now goes through two steps where gcc's `-c` used
+to be one: `$(BUILD)/%.S: kernel/%.c` (CC) then `$(BUILD)/%.o:
+$(BUILD)/%.S` (AS) - GNU Make's implicit-rule search resolves this
+alongside the unrelated `$(BUILD)/%.o: kernel/%.S` rule for the two
+hand-written assembly files (`entry.S`/`idt_stubs.S`) without conflict,
+since the two rules' prerequisite directories never contain the same
+stem. `kernel/builtins_shim.c` and `tools/host_syscalls_shim.c` are
+gone - no longer referenced anywhere - since CC intercepts every
+`__builtin_*`/`__sys_*` call site directly (see the CC section above).
+
+Verified with the full existing test suite: `tools/run_tests.sh` (boot,
+tinyfs mount, every shell command, the scripting language, the bytecode
+compiler+VM) and `tools/run_toolchain_tests.sh`, both green, with zero
+invocations of gcc/nasm/ld/objcopy anywhere in the OS build path.
+
+Getting there surfaced a long tail of real bugs - unlike Phase T5's
+handful, most of these were latent because nothing had ever exercised
+the exact code pattern before (a kernel-only builtin, a language feature
+only the scripting interpreter happened to use, an instruction only one
+driver emitted). Each was found by an actual QEMU boot/GDB session
+against real, previously-untested code, not by inspection:
+
+- **AS - `lgdt`/`lidt` only supported one operand form**: hardcoded to
+  the 16-bit absolute-address form `boot/stage2.S` uses; `__builtin_gdt_flush`'s
+  `lgdt [ecx]` (register-indirect, 32-bit) silently mis-assembled.
+  Added the general `encode_rm32`-based `0F 01 /2` (`lgdt`) and `/3`
+  (`lidt`) form alongside the existing one.
+- **AS - far jump (`jmp SEG:OFFSET`) always used a 16-bit offset**: in
+  32-bit code (`__builtin_gdt_flush`'s CS-reload jump) this is 2 bytes
+  short of the real `ptr16:32` encoding, corrupting every byte after it.
+  Fixed by sizing the offset from `st->bits`, matching every other
+  16-vs-32 branch in the encoder.
+- **CC codegen - `walk_collect`'s extern-duplication fix had a second
+  bug**: temporarily NULLing a top-level node's `->next` to stop
+  re-walking the whole remaining chain (Phase T5's fix) also corrupted
+  `is_local`'s scan of `prog` *while that scan was still in progress*,
+  whenever it reached the currently-truncated node - any same-file
+  function called from code defined *earlier* in the file looked
+  "not local" and got a spurious `extern`, later colliding with its own
+  real definition. Replaced the mutation with `walk_collect_ex(...,
+  skip_next)`, which never touches the shared list at all.
+- **CC codegen - indirect-call detection didn't exclude the extern-
+  function-name pass**: `block_read(...)` (call through a function-
+  pointer variable) still ran through the "not a locally-defined
+  function, so `extern` it" check, `extern`-declaring the *variable*
+  name - which then also got a real local `global` definition in the
+  same file, leaving AS unable to tell which one a `lea eax,
+  [block_read]` reference meant. Skipped for `is_indirect_call` calls.
+- **CC codegen - file-scope `static` variables/functions were always
+  global**: `parse_global_var` never looked at the `static` keyword
+  (only `parse_func` did), so two files' own file-private `static int
+  foo;` would collide as duplicate global symbols. Added
+  `is_file_static`, mirroring the function case.
+- **CC - `switch`/`case`/`default` weren't implemented at all**: not a
+  bug so much as a real gap Phase T2's dialect survey missed (used by
+  `kernel/lang/lexer.c`'s tokenizer switch, among others) - `switch`
+  parsed as an unknown identifier followed by a call, producing garbage.
+  Added as a flat list of case/default label markers inside the switch's
+  block (parsed the same as any other block), with a linear
+  compare-and-jump chain and a hidden per-switch frame slot holding the
+  switch value across the chain - naturally gives C's fallthrough
+  semantics for free, since falling off the end of one case's code just
+  runs into the next label in emission order.
+- **CC - the comma operator was declared (`ND_COMMA` existed) but never
+  actually implemented** - `parse_expr` was just `parse_assign`, so a
+  for-loop's multi-clause increment (`i++, j--`) silently dropped
+  everything after the first comma, desyncing the parser from that point
+  on. Added real comma-operator parsing (distinct from comma-as-
+  separator in call args/declarators/initializers, which already call
+  `parse_assign` directly per element) and trivial codegen (evaluate
+  and discard the left side, keep the right).
+- **CC - self-referential and forward-declared struct tags didn't
+  work**: a struct's own tag was only registered *after* its body was
+  parsed, so `struct node { struct node *next; }` failed to resolve its
+  own self-reference; and `typedef struct node node_t;` with no body
+  (forward declaration before the real definition, `kernel/lang/script/ast.h`'s
+  exact pattern) had no path but "error" at all. Fixed by registering
+  the tag before parsing the body (reusing the same `type_t` if one
+  already exists, so an earlier forward declaration's typedef still sees
+  the real member layout once the full definition arrives) and by
+  creating an incomplete tag on first forward-reference instead of
+  erroring.
+- **CC - function-pointer *parameters* weren't parsed**:
+  `parse_declarator` already handled `T (*name)(params)` for ordinary
+  declarations, but `parse_param_list` had its own simpler inline
+  parameter parser that never checked for the parenthesized form (used
+  by `kernel/lang/compiler/parser.c`'s `parse_binop_level(parser_t *p,
+  ast_node_t *(*next)(parser_t *), ...)`). Added the same form directly
+  to the parameter-parsing loop.
+- **AS - `movzx r32, r16` (register-to-register) had a spurious `0x66`
+  prefix**: legal-looking but wrong - the prefix reinterprets *both*
+  operands as 16-bit, silently downgrading `movzx eax, ax` to a
+  near-no-op `movzx ax, ax` instead of really zero-extending into the
+  full register. Never exercised before: every earlier `movzx` use was
+  the byte-from-memory form (`0F B6`); only CC's new `uint16_t` load path
+  (`mov ax, [eax]` then `movzx eax, ax`, added this phase - see below)
+  hit the register-to-register form (`0F B7`) at all.
+- **CC codegen - no 16-bit (`short`/`uint16_t`) load/store support**:
+  `load_value`/`store_value` only distinguished byte (1) from
+  "everything else, 4 bytes" - a `uint16_t` array element write emitted
+  a plain 4-byte `mov`, silently overwriting the next element's first
+  two bytes on every store. This is exactly `kernel/ata.c`'s PIO loop
+  (`uint16_t *p = buf; p[i] = inw(ATA_DATA);`), which had never been
+  compiled by CC before. Added real 16-bit forms to both, plus the
+  matching `mov r16, r/m16` / `mov r/m16, r16` encodings in AS (only a
+  16-bit-code, bare-label form existed before, for `boot/stage2.S`).
+- **AS - `in`/`out` with a 16-bit accumulator (`in ax, dx` / `out dx,
+  ax`) also needed the `0x66` prefix and didn't have it** - `0xED`/`0xEF`
+  alone, in 32-bit code, means the *32-bit* accumulator form. Every
+  `inw()`/`outw()` call (ATA sector transfers, 256 words per sector) was
+  silently reading/writing **two** 16-bit port words per instruction
+  instead of one, packed into EAX with the low half kept and the high
+  half discarded by the caller's own `movzx` - draining twice as many
+  words off the device as intended and dropping every other one. This
+  produced the session's most confusing bug: correct-looking code,
+  correct-looking disassembly, and a superblock read that silently came
+  back with every other 16-bit word missing.
+- **CC - `T name[] = { ... }` (array size inferred from its
+  initializer) left `array_len` at -1** in both the global
+  (`parse_global_var`) and local (`parse_one_local_decl`, needed for
+  function-local `static const T ops[] = {...}` tables) declaration
+  paths - `type_size` treats a non-positive `array_len` as size 0, so
+  `sizeof(name)` silently came out as 0. `kernel/keyboard.c`'s scancode
+  table used exactly this pattern for its `TABLE_LEN` bounds check
+  (`sizeof(lower_table)/sizeof(lower_table[0])`); with the check always
+  seeing `TABLE_LEN == 0`, `code >= TABLE_LEN` was vacuously true for
+  every scancode, so `keyboard_getchar` detected every keypress
+  correctly but silently discarded all of them instead of ever
+  returning one. Fixed by counting the initializer list's elements once
+  parsing reaches it, in both places.
+- **CC - struct/union-by-value wasn't supported at all**: assignment
+  (`a = b;`), a non-brace initializer (`T save = *p;` -
+  `kernel/lang/script/parser.c`'s assignment-lookahead backtracking:
+  `parser_t save = *p; ... *p = save;`), function return
+  (`kernel/lang/script/eval.c`'s `mkint`/`mkstr` constructors), and
+  by-value parameters (`print_value(value_t v)`) all silently used the
+  scalar 4-byte `mov` path, corrupting or truncating anything bigger
+  than a pointer. This was the session's deepest fix: `load_value` now
+  leaves a struct/union as its own address instead of dereferencing it
+  (the same "decay" `TY_ARRAY` already got), `store_value` gained a
+  byte-copy loop (`codegen_struct_copy` - AS has no `rep movsb`, so it's
+  a plain indexed compare-and-loop like every other loop this codegen
+  emits) for struct/union targets, function returns use the classic
+  hidden-pointer convention (caller allocates a temp slot, passes its
+  address as an implicit first argument at `[ebp+8]`, shifting every
+  real parameter's offset out by 4 - `parse_func`/`ND_RETURN`/
+  `codegen_call_or_builtin` all coordinate on this), and by-value
+  parameters are copied onto the stack at the call site instead of
+  having their address pushed, with `parse_func`'s parameter-offset
+  loop sized per-parameter instead of assuming a flat 4 bytes. (AS's
+  `MAX_STMTS`/`MAX_SYMS`/`MAacross_RELOCS` also had to grow - the
+  struct-copy loop's handful of instructions per copy added up fast in
+  `eval.c`, which does little else.)
+- **CC lexer - `read_escape` had no case for `\b` (or `\f`/`\v`/`\a`)**:
+  fell through to the `default: return c;` branch, so `'\b'` silently
+  lexed to the *letter* `'b'` (0x62) instead of backspace (0x08). This
+  broke two unrelated things built from the same character constant:
+  `kernel/keyboard.c`'s scancode table entry for the real Backspace key
+  (now mapped to the letter b), and - far more visibly -
+  `kernel/shell/shell.c`'s `read_line`'s `if (c == '\b')` check, which
+  became `if (c == 'b')`: typing the *letter* b anywhere in a shell
+  command made `read_line` treat it as a backspace keypress and erase
+  the previous character instead of appending 'b'. Found via the exact
+  symptom: every shell command in the test suite worked except the one
+  containing a 'b' (`build hello.tc hello.tbc`), consistently, regardless
+  of keystroke timing - which ruled out a timing race and pointed at the
+  character itself.
+
 ## Bootstrap
 
 _To be filled in once Phase T8 lands: the Stage0/1/2/3 procedure and how

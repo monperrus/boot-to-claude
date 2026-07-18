@@ -206,8 +206,25 @@ static type_t *parse_type_spec(parser_t *p, int *is_static, int *is_extern) {
             tag_t *existing = tagname[0] ? tag_find(p, tagname) : NULL;
             if (check(p, TK_LBRACE)) {
                 advance(p);
-                st = type_new(is_union ? TY_UNION : TY_STRUCT);
+                /* Reuse the existing (possibly still-incomplete, from an
+                 * earlier forward declaration) type_t instance rather than
+                 * allocating a new one, so any typedef/pointer that
+                 * already captured its address sees the real members once
+                 * this definition completes it - see the forward-decl
+                 * branch below. */
+                st = existing ? existing->type : type_new(is_union ? TY_UNION : TY_STRUCT);
                 safe_strcpy(st->tag, tagname, MAX_NAME);
+                /* Register the tag *before* parsing the body, not after -
+                 * a self-referential member (`struct node *next;` inside
+                 * `struct node { ... }`) needs to find its own tag while
+                 * still inside its own member list. */
+                if (tagname[0] && !existing) {
+                    tag_t *tg = calloc(1, sizeof(tag_t));
+                    safe_strcpy(tg->name, tagname, MAX_NAME);
+                    tg->type = st;
+                    tg->next = p->tags;
+                    p->tags = tg;
+                }
                 st->members = parse_struct_members(p);
                 expect(p, TK_RBRACE);
                 if (is_kw(p, "__attribute__")) {
@@ -221,17 +238,26 @@ static type_t *parse_type_spec(parser_t *p, int *is_static, int *is_extern) {
                  * immediately, and nothing else is guaranteed to trigger
                  * layout before then. */
                 type_size(st);
-                if (tagname[0]) {
-                    tag_t *tg = calloc(1, sizeof(tag_t));
-                    safe_strcpy(tg->name, tagname, MAX_NAME);
-                    tg->type = st;
-                    tg->next = p->tags;
-                    p->tags = tg;
-                }
             } else if (existing) {
-                st = existing->type;
+                st = existing->type; /* complete or still-incomplete - fine as long as only used via pointer */
+            } else if (tagname[0]) {
+                /* Forward declaration (`struct Foo;` or a typedef like
+                 * `typedef struct ast_node ast_node_t;` before the real
+                 * definition) - register an incomplete tag now so later
+                 * pointer-only uses (and the eventual real definition,
+                 * via the `existing` branch above) resolve to the same
+                 * type_t instance. Only valid as `struct Foo *` until
+                 * completed; type_size on a bare incomplete struct/union
+                 * would still be meaningless, same as real C. */
+                st = type_new(is_union ? TY_UNION : TY_STRUCT);
+                safe_strcpy(st->tag, tagname, MAX_NAME);
+                tag_t *tg = calloc(1, sizeof(tag_t));
+                safe_strcpy(tg->name, tagname, MAX_NAME);
+                tg->type = st;
+                tg->next = p->tags;
+                p->tags = tg;
             } else {
-                perr(p, "unknown struct/union tag");
+                perr(p, "anonymous struct/union with no body");
                 return NULL;
             }
             named = st;
@@ -336,11 +362,30 @@ static type_t *parse_param_list(parser_t *p, char names[][MAX_NAME], int *n_name
         type_t *pt = base;
         char nm[MAX_NAME] = {0};
         while (match(p, TK_STAR)) pt = ptr_to(pt);
-        if (check(p, TK_IDENT)) { safe_strcpy(nm, cur(p).text, MAX_NAME); advance(p); }
-        while (match(p, TK_LBRACKET)) {
-            if (!check(p, TK_RBRACKET)) advance(p);
-            expect(p, TK_RBRACKET);
-            pt = ptr_to(pt); /* array param decays to pointer */
+        if (check(p, TK_LPAREN) && p->toks[p->pos + 1].kind == TK_STAR) {
+            /* function-pointer parameter: TYPE (*name)(PARAMS), e.g.
+             * parse_binop_level's `ast_node_t *(*next)(parser_t *)` -
+             * mirrors parse_declarator's identical form, duplicated here
+             * (rather than delegating to it) because plain parameters in
+             * this loop tolerate an unnamed parameter and parse_declarator
+             * doesn't. */
+            advance(p);
+            expect(p, TK_STAR);
+            if (check(p, TK_IDENT)) { safe_strcpy(nm, cur(p).text, MAX_NAME); advance(p); }
+            expect(p, TK_RPAREN);
+            expect(p, TK_LPAREN);
+            type_t *functy = type_new(TY_FUNC);
+            functy->base = pt;
+            functy->param = parse_param_list(p, NULL, NULL);
+            expect(p, TK_RPAREN);
+            pt = ptr_to(functy);
+        } else {
+            if (check(p, TK_IDENT)) { safe_strcpy(nm, cur(p).text, MAX_NAME); advance(p); }
+            while (match(p, TK_LBRACKET)) {
+                if (!check(p, TK_RBRACKET)) advance(p);
+                expect(p, TK_RBRACKET);
+                pt = ptr_to(pt); /* array param decays to pointer */
+            }
         }
         type_t *node = type_new(pt->kind);
         *node = *pt;
@@ -502,6 +547,18 @@ static node_t *parse_primary(parser_t *p) {
                     safe_strcpy(call->asm_label, vs->asm_label, MAX_NAME);
                     call->type = vs->type->base->base;
                 }
+            }
+            /* Struct/union-returning call: needs a hidden temp slot in
+             * *this* function's frame to hold the result (the callee
+             * writes into it via a hidden pointer argument - see
+             * parse_func/codegen.c's ND_RETURN). Stashed in call->num
+             * (unused by ND_CALL otherwise) rather than
+             * call->frame_offset, which is_indirect_call above may
+             * already be using for the callee variable's own location. */
+            if (call->type->kind == TY_STRUCT || call->type->kind == TY_UNION) {
+                p->frame_size += type_size(call->type);
+                p->frame_size = (p->frame_size + 3) & ~3;
+                call->num = -p->frame_size;
             }
             return call;
         }
@@ -703,7 +760,23 @@ static node_t *parse_assign(parser_t *p) {
     return lhs;
 }
 
-static node_t *parse_expr(parser_t *p) { return parse_assign(p); }
+/* The comma *operator* (evaluate left, discard, evaluate right - e.g. a
+ * for-loop increment clause like `pn = pn->next, i++`), distinct from
+ * comma as a plain separator (call args, declarator lists, initializer
+ * elements) - those call parse_assign directly for each element, so
+ * this only ever fires where a full expression was asked for. */
+static node_t *parse_expr(parser_t *p) {
+    node_t *n = parse_assign(p);
+    while (match(p, TK_COMMA)) {
+        node_t *rhs = parse_assign(p);
+        node_t *c = node_new(ND_COMMA);
+        c->a = n;
+        c->b = rhs;
+        c->type = rhs->type;
+        n = c;
+    }
+    return n;
+}
 
 /* ---------------- initializers ---------------- */
 
@@ -742,6 +815,16 @@ static node_t *parse_one_local_decl(parser_t *p, type_t *base, int is_static) {
     safe_strcpy(n->asm_label, s->asm_label, MAX_NAME);
     n->frame_offset = s->frame_offset;
     if (match(p, TK_ASSIGN)) n->init = parse_initializer(p);
+    /* Same `T name[] = { ... }` size-inference fix as parse_global_var -
+     * needed here too for e.g. a function-local `static const T ops[] =
+     * {...};` (used throughout the kernel's scripting-language parser
+     * files) - see that function's comment for why array_len otherwise
+     * silently means sizeof(name) == 0. */
+    if (t->kind == TY_ARRAY && t->array_len < 0 && n->init && n->init->kind == ND_BLOCK) {
+        int count = 0;
+        for (node_t *v = n->init->list; v; v = v->next) count++;
+        t->array_len = count;
+    }
     return n;
 }
 
@@ -811,6 +894,37 @@ static node_t *parse_stmt(parser_t *p) {
     }
     if (match_kw(p, "break")) { expect(p, TK_SEMI); return node_new(ND_BREAK); }
     if (match_kw(p, "continue")) { expect(p, TK_SEMI); return node_new(ND_CONTINUE); }
+    if (match_kw(p, "switch")) {
+        expect(p, TK_LPAREN);
+        node_t *n = node_new(ND_SWITCH);
+        n->a = parse_expr(p);
+        expect(p, TK_RPAREN);
+        /* Hidden frame slot to hold the switch value across codegen's
+         * compare chain - same "min 4-byte slot" convention as
+         * add_local, but with no symbol-table entry (never referenced
+         * by name, so nothing else needs to find it). */
+        p->frame_size += 4;
+        p->frame_size = (p->frame_size + 3) & ~3;
+        n->frame_offset = -p->frame_size;
+        n->b = parse_block(p);
+        return n;
+    }
+    /* `case`/`default` are zero-width label statements, not statements
+     * with their own body (see codegen.c's ND_SWITCH) - parse_block's
+     * ordinary statement loop naturally makes the *next* statement a
+     * separate list entry, which is exactly what C's fallthrough
+     * semantics need. */
+    if (match_kw(p, "case")) {
+        node_t *n = node_new(ND_CASE);
+        n->num = parse_const_expr(p);
+        expect(p, TK_COLON);
+        return n;
+    }
+    if (match_kw(p, "default")) {
+        node_t *n = node_new(ND_DEFAULT);
+        expect(p, TK_COLON);
+        return n;
+    }
     if (match(p, TK_SEMI)) return node_new(ND_NOP);
 
     if (is_type_start(p)) return parse_local_decl_stmt(p);
@@ -837,15 +951,26 @@ static node_t *parse_block(parser_t *p) {
 
 /* ---------------- top level ---------------- */
 
-static node_t *parse_global_var(parser_t *p, const char *name, type_t *t, int is_extern) {
+static node_t *parse_global_var(parser_t *p, const char *name, type_t *t, int is_extern, int is_static) {
     add_global(p, name, t);
     node_t *n = node_new(ND_VAR_DECL);
     safe_strcpy(n->name, name, MAX_NAME);
     n->type = t;
     n->is_global = 1;
     n->is_extern_decl = is_extern;
+    n->is_file_static = is_static;
     safe_strcpy(n->asm_label, name, MAX_NAME);
     if (match(p, TK_ASSIGN)) n->init = parse_initializer(p);
+    /* `T name[] = { ... };` - array_len was left at -1 by parse_declarator
+     * (no size between the brackets), and type_size() treats a non-
+     * positive array_len as size 0 - silently making sizeof(name) come
+     * out as 0 instead of the real, initializer-inferred length. Fix it
+     * up now that the initializer list is available to count. */
+    if (t->kind == TY_ARRAY && t->array_len < 0 && n->init && n->init->kind == ND_BLOCK) {
+        int count = 0;
+        for (node_t *v = n->init->list; v; v = v->next) count++;
+        t->array_len = count;
+    }
     return n;
 }
 
@@ -865,9 +990,15 @@ static node_t *parse_func(parser_t *p, const char *name, type_t *functy,
     n->is_global = !is_static; /* controls whether codegen emits `global` - C's static limits linkage */
     safe_strcpy(n->asm_label, name, MAX_NAME);
 
-    /* cdecl: EBP+8, +12, ... for params, in order */
+    /* cdecl: EBP+8, +12, ... for params, in order - except when the
+     * return type is a struct/union, which doesn't fit in EAX. That
+     * uses the classic hidden-pointer convention instead: the caller
+     * passes the address to write the result into as an implicit first
+     * argument, at [ebp+8], pushing every real parameter's offset out
+     * by 4 (see codegen.c's ND_RETURN and codegen_call_or_builtin). */
+    int returns_struct = functy->base->kind == TY_STRUCT || functy->base->kind == TY_UNION;
     type_t *pt = functy->param;
-    int off = 8;
+    int off = returns_struct ? 12 : 8;
     node_t *ptail = NULL;
     for (int i = 0; i < n_params && pt; i++, pt = pt->next) {
         sym_t *s = calloc(1, sizeof(sym_t));
@@ -876,7 +1007,17 @@ static node_t *parse_func(parser_t *p, const char *name, type_t *functy,
         s->frame_offset = off;
         s->next = p->locals;
         p->locals = s;
-        off += 4;
+        /* Struct/union parameters are passed by value as their real
+         * (4-byte-rounded) size, not a flat 4 bytes like every scalar/
+         * pointer param - the caller copies the whole struct onto the
+         * stack (see codegen_call_or_builtin), so subsequent params'
+         * offsets need to account for its actual width. */
+        if (pt->kind == TY_STRUCT || pt->kind == TY_UNION) {
+            int sz = (type_size(pt) + 3) & ~3;
+            off += sz < 4 ? 4 : sz;
+        } else {
+            off += 4;
+        }
 
         node_t *pn = node_new(ND_VAR_DECL);
         safe_strcpy(pn->name, param_names[i], MAX_NAME);
@@ -933,11 +1074,11 @@ node_t *cc_parse(token_t *toks, int n_toks) {
                 if (t->kind == TY_FUNC) {
                     decl = parse_func(&p, name, t, param_names, n_params, is_static);
                 } else {
-                    decl = parse_global_var(&p, name, t, is_extern);
+                    decl = parse_global_var(&p, name, t, is_extern, is_static);
                     while (match(&p, TK_COMMA)) {
                         char name2[MAX_NAME];
                         type_t *t2 = parse_declarator(&p, base, name2, NULL, NULL);
-                        node_t *more = parse_global_var(&p, name2, t2, is_extern);
+                        node_t *more = parse_global_var(&p, name2, t2, is_extern, is_static);
                         decl->next = more;
                     }
                     expect(&p, TK_SEMI);

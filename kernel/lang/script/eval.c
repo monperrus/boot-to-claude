@@ -45,7 +45,12 @@ typedef struct {
     value_t return_value;
 } exec_result_t;
 
-static const value_t VAL_ZERO = { VAL_INT, { .i = 0 } };
+/* Positional, not `{ .i = 0 }` - CC's initializer parser doesn't support
+ * designated initializers (a real gap, but a one-site tweak here is
+ * simpler than adding the feature - see docs/toolchain.md). Equivalent:
+ * `i` is the union's first member, and both members are zeroed either
+ * way since nothing here ever reads VAL_ZERO through `.s`. */
+static const value_t VAL_ZERO = { VAL_INT, { 0 } };
 
 /* Constructors used in place of compound literals (`(value_t){...}`) -
  * kept out of tinyC's dialect deliberately (see docs/toolchain.md): the

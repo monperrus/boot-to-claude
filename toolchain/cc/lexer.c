@@ -45,6 +45,10 @@ static int read_escape(lexer_t *lx) {
         case 'n': return '\n';
         case 't': return '\t';
         case 'r': return '\r';
+        case 'b': return '\b';
+        case 'f': return '\f';
+        case 'v': return '\v';
+        case 'a': return '\a';
         case '0': return '\0';
         case '\\': return '\\';
         case '\'': return '\'';

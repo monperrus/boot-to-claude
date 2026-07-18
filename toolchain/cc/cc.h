@@ -124,6 +124,7 @@ typedef enum {
     ND_PREINC, ND_PREDEC, ND_POSTINC, ND_POSTDEC,
     ND_CALL, ND_INDEX, ND_MEMBER, ND_ARROW, ND_CAST, ND_SIZEOF, ND_TERNARY, ND_COMMA,
     ND_IF, ND_WHILE, ND_DOWHILE, ND_FOR, ND_RETURN, ND_BREAK, ND_CONTINUE,
+    ND_SWITCH, ND_CASE, ND_DEFAULT,
     ND_BLOCK, ND_EXPR_STMT, ND_NOP,
     ND_FUNC_DEF, ND_VAR_DECL,
 } node_kind_t;
@@ -145,6 +146,10 @@ struct node {
     /* variable/function storage location, resolved during parsing */
     int is_global;
     int is_static_local;     /* function-local `static` - lives in .data/.bss, own label */
+    int is_file_static;      /* file-scope `static T name;` - still needs storage (is_global
+                               * stays 1 for that purpose) but must not get a `global` directive:
+                               * two files each with their own file-private `static int foo;`
+                               * would otherwise collide as duplicate global symbols at link time. */
     int frame_offset;          /* local/param: EBP-relative byte offset */
     char asm_label[MAX_NAME];   /* global / static-local: the label CC emits for it */
     int is_indirect_call;         /* ND_CALL: callee is a function-pointer variable

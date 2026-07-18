@@ -38,26 +38,72 @@ static void new_label(char *buf) {
 static void codegen_expr(node_t *n);
 static void codegen_addr(node_t *n);
 static void codegen_stmt(node_t *n);
+static void codegen_init_local(int base_offset, type_t *t, node_t *init);
 static void codegen_call_or_builtin(node_t *n);
 
 /* ---------------- loads/stores sized per C type ---------------- */
 
 static int is_byte_type(type_t *t) { return t->kind == TY_CHAR; }
+static int is_short_type(type_t *t) { return t->kind == TY_SHORT; }
 
 /* Address already in EAX; loads the value (sized per `t`) into EAX. */
 static void load_value(type_t *t) {
     if (t->kind == TY_ARRAY) return; /* arrays decay to their own address - nothing to load */
+    if (t->kind == TY_STRUCT || t->kind == TY_UNION) return; /* same - see store_value's struct-copy branch */
     if (is_byte_type(t)) {
         out("    movzx eax, byte [eax]\n");
+    } else if (is_short_type(t)) {
+        /* mov ax, [eax] reads through the same register that holds the
+         * address (ax is eax's low 16 bits) - fine, the CPU reads the
+         * memory operand before writing the result back. movzx then
+         * clears the high 16 bits, which the mov left as whatever
+         * garbage eax's upper half held before. */
+        out("    mov ax, [eax]\n    movzx eax, ax\n");
     } else {
         out("    mov eax, [eax]\n");
     }
 }
 
+/* Byte-by-byte copy, EAX=src address, ECX=dst address (the same
+ * convention store_value's other branches use for "value" and
+ * "destination"). Needed because a struct/union doesn't fit in a
+ * register - whole-struct assignment (`a = b;`, or a non-brace
+ * initializer like `parser_t save = *p;`) needs an actual memcpy, not a
+ * single mov. AS has no rep movsb, so this is a plain compare-and-loop
+ * like every other loop this codegen emits. */
+static void codegen_struct_copy(type_t *t) {
+    char ltop[MAX_NAME], lend[MAX_NAME];
+    new_label(ltop); new_label(lend);
+    out("    push eax\n");    /* [esp+4] = src */
+    out("    push ecx\n");      /* [esp] = dst */
+    out("    mov edx, 0\n");      /* edx = i - a register, not a stack slot,
+                                    * so every compare/add below already has
+                                    * a register operand and never needs an
+                                    * explicit dword-size hint on bare
+                                    * memory + immediate. */
+    out("%s:\n", ltop);
+    out("    cmp edx, %d\n", type_size(t));
+    out("    jge %s\n", lend);
+    out("    mov eax, [esp+4]\n");   /* src */
+    out("    add eax, edx\n");         /* + i */
+    out("    movzx eax, byte [eax]\n");  /* eax = src[i] */
+    out("    mov ecx, [esp]\n");           /* dst */
+    out("    add ecx, edx\n");               /* + i */
+    out("    mov [ecx], al\n");                /* dst[i] = src[i] */
+    out("    add edx, 1\n");
+    out("    jmp %s\n", ltop);
+    out("%s:\n", lend);
+    out("    add esp, 8\n");
+}
+
 /* Stores EAX's value into the address in ECX. */
 static void store_value(type_t *t) {
-    if (is_byte_type(t)) {
+    if (t->kind == TY_STRUCT || t->kind == TY_UNION) {
+        codegen_struct_copy(t);
+    } else if (is_byte_type(t)) {
         out("    mov [ecx], al\n");
+    } else if (is_short_type(t)) {
+        out("    mov [ecx], ax\n");
     } else {
         out("    mov [ecx], eax\n");
     }
@@ -288,6 +334,13 @@ static void codegen_expr(node_t *n) {
             codegen_addr(n);
             load_value(n->type);
             return;
+        case ND_COMMA:
+            /* Evaluate and discard the left operand, then evaluate the
+             * right - both land in eax by convention, so evaluating `b`
+             * second naturally overwrites `a`'s (unused) result. */
+            codegen_expr(n->a);
+            codegen_expr(n->b);
+            return;
         default:
             fprintf(stderr, "cc: internal error: unsupported expression kind %d\n", n->kind);
             exit(1);
@@ -305,9 +358,37 @@ static void codegen_call_or_builtin(node_t *n) {
     int argc = 0;
     node_t *args[16];
     for (node_t *a = n->list; a; a = a->next) args[argc++] = a;
+    int total_bytes = 0;
     for (int i = argc - 1; i >= 0; i--) {
         codegen_expr(args[i]);
+        if (args[i]->type->kind == TY_STRUCT || args[i]->type->kind == TY_UNION) {
+            /* Struct/union by value: codegen_expr already yields its
+             * address (see load_value), not its bytes - copy the whole
+             * thing onto the stack rather than pushing a 4-byte pointer,
+             * matching parse_func's real-size parameter offsets. */
+            int sz = type_size(args[i]->type);
+            sz = (sz + 3) & ~3;
+            if (sz < 4) sz = 4;
+            out("    mov ecx, eax\n");   /* save src - sub esp doesn't touch ecx */
+            out("    sub esp, %d\n", sz);
+            out("    mov eax, ecx\n");     /* src */
+            out("    mov ecx, esp\n");       /* dst = the space just reserved */
+            codegen_struct_copy(args[i]->type);
+            total_bytes += sz;
+        } else {
+            out("    push eax\n");
+            total_bytes += 4;
+        }
+    }
+    /* Struct/union return: pass the hidden temp slot's address (see
+     * parse_primary's ND_CALL construction) as an implicit extra
+     * argument, pushed last so it lands first from the callee's side
+     * ([ebp+8] - matches parse_func's `returns_struct` offset shift). */
+    int is_struct_return = n->type->kind == TY_STRUCT || n->type->kind == TY_UNION;
+    if (is_struct_return) {
+        out("    lea eax, [ebp%+lld]\n", (long long)n->num);
         out("    push eax\n");
+        total_bytes += 4;
     }
     if (n->is_indirect_call) {
         /* Callee is a function-pointer variable (e.g. tinyfs_init's
@@ -322,7 +403,11 @@ static void codegen_call_or_builtin(node_t *n) {
     } else {
         out("    call %s\n", n->name);
     }
-    if (argc) out("    add esp, %d\n", argc * 4);
+    if (total_bytes) out("    add esp, %d\n", total_bytes);
+    /* eax already holds the hidden slot's address on return (ND_RETURN
+     * leaves it there) - exactly the "address of a struct-typed rvalue"
+     * convention load_value/codegen_expr already use elsewhere, so
+     * nothing further to do here for is_struct_return. */
 }
 
 /* ---------------- statements ---------------- */
@@ -337,17 +422,11 @@ static void codegen_stmt(node_t *n) {
             return;
         case ND_VAR_DECL:
             if (n->is_static_local) return; /* emitted into .data/.bss separately */
-            /* Brace-init lists (`{1,2,3}`) are only supported for
-             * globals/statics (compile-time .data, see emit_data_bytes)
-             * - this codebase never brace-initializes a plain (stack)
-             * local, only scalars. */
-            if (n->init) {
-                out("    lea eax, [ebp%+d]\n", n->frame_offset);
-                out("    push eax\n");
-                codegen_expr(n->init);
-                out("    pop ecx\n");
-                store_value(n->type);
-            }
+            /* codegen_init_local handles both brace-init lists (e.g.
+             * eval.c's `exec_result_t r = { EXEC_NORMAL, VAL_ZERO };`)
+             * and plain scalar initializers - a bare `int x = 1;` is
+             * just its one-element base case. */
+            if (n->init) codegen_init_local(n->frame_offset, n->type, n->init);
             return;
         case ND_IF: {
             char lelse[MAX_NAME], lend[MAX_NAME];
@@ -416,7 +495,20 @@ static void codegen_stmt(node_t *n) {
             return;
         }
         case ND_RETURN:
-            if (n->a) codegen_expr(n->a);
+            if (n->a && (n->a->type->kind == TY_STRUCT || n->a->type->kind == TY_UNION)) {
+                /* Hidden-pointer struct return (see parse_func /
+                 * codegen_call_or_builtin): copy the result into the
+                 * caller-supplied slot at [ebp+8], then hand that same
+                 * address back in eax - the call site relies on it
+                 * being there, same convention as any other
+                 * struct-typed rvalue address. */
+                codegen_expr(n->a);          /* eax = src address */
+                out("    mov ecx, [ebp+8]\n");   /* ecx = dst address */
+                codegen_struct_copy(n->a->type);
+                out("    mov eax, [ebp+8]\n");
+            } else if (n->a) {
+                codegen_expr(n->a);
+            }
             out("    mov esp, ebp\n    pop ebp\n    ret\n");
             return;
         case ND_BREAK:
@@ -425,6 +517,46 @@ static void codegen_stmt(node_t *n) {
         case ND_CONTINUE:
             out("    jmp %s\n", g_loop->continue_label);
             return;
+        case ND_SWITCH: {
+            /* n->b is an ND_BLOCK whose ->list is a flat chain of
+             * case/default markers interleaved with ordinary statements -
+             * parsed via the regular parse_block, since `case`/`default`
+             * are just zero-width label statements (see parser.c). Walking
+             * that chain linearly and falling through unless a `break`
+             * jumps out reproduces C's fallthrough semantics for free. */
+            char lend[MAX_NAME];
+            new_label(lend);
+            codegen_expr(n->a);
+            out("    mov [ebp%+d], eax\n", n->frame_offset);
+
+            char default_label[MAX_NAME] = "";
+            for (node_t *s = n->b->list; s; s = s->next) {
+                if (s->kind == ND_CASE || s->kind == ND_DEFAULT) new_label(s->asm_label);
+                if (s->kind == ND_DEFAULT) safe_strcpy(default_label, s->asm_label, MAX_NAME);
+            }
+            for (node_t *s = n->b->list; s; s = s->next) {
+                if (s->kind != ND_CASE) continue;
+                out("    mov eax, [ebp%+d]\n", n->frame_offset);
+                out("    cmp eax, %lld\n", (long long)s->num);
+                out("    je %s\n", s->asm_label);
+            }
+            out("    jmp %s\n", default_label[0] ? default_label : lend);
+
+            loop_ctx_t lc = { "", "", g_loop };
+            safe_strcpy(lc.break_label, lend, MAX_NAME);
+            /* `continue` inside a switch targets the nearest *enclosing
+             * loop*, not the switch itself - inherit the parent frame's
+             * continue_label rather than giving this frame its own. */
+            safe_strcpy(lc.continue_label, g_loop ? g_loop->continue_label : "", MAX_NAME);
+            g_loop = &lc;
+            for (node_t *s = n->b->list; s; s = s->next) {
+                if (s->kind == ND_CASE || s->kind == ND_DEFAULT) out("%s:\n", s->asm_label);
+                else codegen_stmt(s);
+            }
+            g_loop = lc.parent;
+            out("%s:\n", lend);
+            return;
+        }
         case ND_NOP:
             return;
         default:
@@ -449,12 +581,62 @@ static void emit_data_bytes(node_t *init, type_t *t) {
     }
     if (t->kind == TY_ARRAY && init->kind == ND_BLOCK) {
         int count = 0;
-        for (node_t *v = init->list; v; v = v->next) { emit_scalar_bytes(v, t->base); count++; }
+        for (node_t *v = init->list; v; v = v->next) { emit_data_bytes(v, t->base); count++; }
         int pad = t->array_len - count;
         for (int i = 0; i < pad; i++) out("    resb %d\n", type_size(t->base));
         return;
     }
+    if ((t->kind == TY_STRUCT || t->kind == TY_UNION) && init->kind == ND_BLOCK) {
+        /* Positional: walk declared members alongside the initializer
+         * list (no designated-initializer support - see
+         * docs/toolchain.md). A union brace-init like value_t's
+         * `{ VAL_INT, { 0 } }` naturally works here too: its one element
+         * targets the first member at offset 0, and the trailing-padding
+         * check below fills out the rest of the union's size. */
+        member_t *m = t->members;
+        node_t *v = init->list;
+        int cur_off = 0;
+        for (; m && v; m = m->next, v = v->next) {
+            if (m->offset > cur_off) out("    resb %d\n", m->offset - cur_off);
+            emit_data_bytes(v, m->type);
+            cur_off = m->offset + type_size(m->type);
+        }
+        int total = type_size(t);
+        if (total > cur_off) out("    resb %d\n", total - cur_off);
+        return;
+    }
     emit_scalar_bytes(init, t);
+}
+
+/* Runtime equivalent of emit_data_bytes, for a local (stack) variable's
+ * brace-init - e.g. `exec_result_t r = { EXEC_NORMAL, VAL_ZERO };` (used
+ * in kernel/lang/script/eval.c). Recurses the same way, but instead of
+ * writing bytes it emits store instructions relative to a base
+ * ebp-offset; a plain scalar just evaluates and stores at that offset,
+ * which also serves as the non-aggregate base case (a bare `int x = 1;`
+ * behaves like a one-element "aggregate" of itself). */
+static void codegen_init_local(int base_offset, type_t *t, node_t *init) {
+    if (t->kind == TY_ARRAY && init->kind == ND_BLOCK) {
+        int off = 0;
+        for (node_t *v = init->list; v; v = v->next) {
+            codegen_init_local(base_offset + off, t->base, v);
+            off += type_size(t->base);
+        }
+        return;
+    }
+    if ((t->kind == TY_STRUCT || t->kind == TY_UNION) && init->kind == ND_BLOCK) {
+        member_t *m = t->members;
+        node_t *v = init->list;
+        for (; m && v; m = m->next, v = v->next) {
+            codegen_init_local(base_offset + m->offset, m->type, v);
+        }
+        return;
+    }
+    out("    lea eax, [ebp%+d]\n", base_offset);
+    out("    push eax\n");
+    codegen_expr(init);
+    out("    pop ecx\n");
+    store_value(t);
 }
 
 static void codegen_func(node_t *fn) {
@@ -492,9 +674,33 @@ static int g_n_strings;
  * section context here) two things in one pass: names of called-but-not-
  * locally-defined, non-builtin functions (need `extern`), and string
  * literal nodes (need their bytes emitted into a data section later). */
-static void walk_collect(node_t *n, node_t *prog) {
+/* skip_next=1 for the one call the top-level driver makes per top-level
+ * node (see codegen_emit) - that loop already advances over prog's own
+ * ->next chain itself, and recursing into ->next there too would
+ * re-walk (and re-collect) the whole remaining top-level chain on every
+ * iteration. An earlier version of this fix instead temporarily NULLed
+ * n->next around that call, which corrupted prog's chain *while it was
+ * still being scanned* by the is_local check below whenever that scan
+ * reached the currently-truncated node - any forward-referenced same-
+ * file function (called from a function defined earlier in the file)
+ * would then look "not local" and get a spurious `extern`, colliding at
+ * link time with the real definition once another file defined a same-
+ * named local of its own. skip_next avoids the mutation entirely: below
+ * ->next is walked normally for every *nested* recursion (statement
+ * sibling chains reached via ->list/->init still need it), just not for
+ * this one top-level entry point. */
+static void walk_collect_ex(node_t *n, node_t *prog, int skip_next) {
     if (!n) return;
-    if (n->kind == ND_CALL) {
+    /* is_indirect_call: the callee is a variable (see cc.h/parser.c),
+     * not a function symbol at all - e.g. tinyfs.c's `block_read(...)`
+     * calls through a function-pointer global. Its linkage is handled
+     * entirely by the ordinary global/extern-variable machinery
+     * (is_extern_decl below); treating n->name as a possibly-external
+     * *function* name here as well double-declared it (`extern
+     * block_read` *and* a real local `global block_read` definition in
+     * the same file), which left AS unable to tell which one a
+     * `lea eax, [block_read]` reference should resolve to. */
+    if (n->kind == ND_CALL && !n->is_indirect_call) {
         int is_local = 0;
         for (node_t *f = prog; f; f = f->next) {
             if (f->kind == ND_FUNC_DEF && strcmp(f->name, n->name) == 0) { is_local = 1; break; }
@@ -513,13 +719,13 @@ static void walk_collect(node_t *n, node_t *prog) {
     if (n->kind == ND_VAR_DECL && n->is_static_local && g_n_statics < MAX_STATICS) {
         g_statics[g_n_statics++] = n;
     }
-    walk_collect(n->a, prog);
-    walk_collect(n->b, prog);
-    walk_collect(n->c, prog);
-    walk_collect(n->d, prog);
-    walk_collect(n->list, prog);
-    walk_collect(n->init, prog);
-    walk_collect(n->next, prog);
+    walk_collect_ex(n->a, prog, 0);
+    walk_collect_ex(n->b, prog, 0);
+    walk_collect_ex(n->c, prog, 0);
+    walk_collect_ex(n->d, prog, 0);
+    walk_collect_ex(n->list, prog, 0);
+    walk_collect_ex(n->init, prog, 0);
+    if (!skip_next) walk_collect_ex(n->next, prog, 0);
 }
 
 void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
@@ -534,19 +740,23 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
     out("BITS 32\n");
 
     for (node_t *n = prog; n; n = n->next) {
-        /* walk_collect recurses into ->next (needed for sibling statement
-         * chains reached via ->list/->init) - passing a top-level node
-         * straight through would also walk the rest of the top-level
-         * chain, which this loop is already advancing over itself,
-         * causing every node after the first to be collected once per
-         * remaining prefix (quadratic duplication of externs/strings).
-         * Cut the top-level ->next link before recursing into this one
-         * node's own subtree, then restore it. */
-        node_t *saved_next = n->next;
-        n->next = NULL;
-        if (n->kind != ND_FUNC_DEF) walk_collect(n, prog); /* globals: just for string literals in initializers */
-        else walk_collect(n->b, prog);                       /* function bodies */
-        n->next = saved_next;
+        /* skip_next=1: this loop already advances over prog's top-level
+         * chain itself (see walk_collect_ex's comment). */
+        if (n->kind != ND_FUNC_DEF) walk_collect_ex(n, prog, 1); /* globals: just for string literals in initializers */
+        else walk_collect_ex(n->b, prog, 1);                       /* function bodies */
+    }
+    /* extern variable declarations (e.g. idt.c's `extern uint32_t
+     * isr_stub_table[32];`, defined in idt_stubs.S) need the same
+     * `extern NAME` treatment as called-but-not-locally-defined
+     * functions above - walk_collect only looks at ND_CALL, never plain
+     * variable references, so this is a separate pass. Without it, AS
+     * drops any relocation against a name with no local definition and
+     * no explicit `extern` (see docs/toolchain.md) - the reference
+     * would silently resolve to nothing instead of erroring. */
+    for (node_t *n = prog; n; n = n->next) {
+        if (n->kind == ND_VAR_DECL && n->is_extern_decl && !already_extern(n->name) && g_n_externs < MAX_EXTERNS) {
+            safe_strcpy(g_externs[g_n_externs++], n->name, MAX_NAME);
+        }
     }
     for (int i = 0; i < g_n_externs; i++) out("extern %s\n", g_externs[i]);
 
@@ -586,8 +796,13 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
     if (g_n_strings) {
         out("section .rodata\n");
         for (int i = 0; i < g_n_strings; i++) {
+            /* Not `global`: __str_N is numbered per translation unit
+             * (parser_t's next_str_id resets for every file CC runs on),
+             * only ever referenced from within the same file, and
+             * marking it global made every file's __str_0 collide with
+             * every other file's at link time. */
             node_t *s = g_strings[i];
-            out("global %s\n%s:\n", s->asm_label, s->asm_label);
+            out("%s:\n", s->asm_label);
             for (const char *p = s->str; ; p++) {
                 out("    db %d\n", (int)(unsigned char)*p);
                 if (!*p) break;
@@ -597,7 +812,11 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
 
     int any_data = 0, any_bss = 0;
     for (node_t *n = prog; n; n = n->next) {
-        if (n->kind == ND_VAR_DECL && n->is_global) {
+        /* is_extern_decl: a declaration only (`extern T name;`), not a
+         * definition - it must never get its own storage, real or
+         * otherwise it silently duplicates whatever file actually
+         * defines the symbol (see the extern-collection pass above). */
+        if (n->kind == ND_VAR_DECL && n->is_global && !n->is_extern_decl) {
             if (n->init) any_data = 1; else any_bss = 1;
         }
     }
@@ -608,15 +827,22 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
     if (any_data) {
         out("section .data\n");
         for (node_t *n = prog; n; n = n->next) {
-            if (n->kind == ND_VAR_DECL && n->is_global && n->init) {
-                out("global %s\n%s:\n", n->asm_label, n->asm_label);
+            if (n->kind == ND_VAR_DECL && n->is_global && !n->is_extern_decl && n->init) {
+                /* file-scope `static` keeps internal linkage - no `global`,
+                 * same reasoning as function-local statics below (two
+                 * files' own file-private `static T name;` must not
+                 * collide as duplicate global symbols). */
+                if (!n->is_file_static) out("global %s\n", n->asm_label);
+                out("%s:\n", n->asm_label);
                 emit_data_bytes(n->init, n->type);
             }
         }
         for (int i = 0; i < g_n_statics; i++) {
+            /* Not `global`, same reasoning as __str_N above -
+             * __static_N is only numbered uniquely within one file. */
             node_t *n = g_statics[i];
             if (n->init) {
-                out("global %s\n%s:\n", n->asm_label, n->asm_label);
+                out("%s:\n", n->asm_label);
                 emit_data_bytes(n->init, n->type);
             }
         }
@@ -624,14 +850,15 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
     if (any_bss) {
         out("section .bss\n");
         for (node_t *n = prog; n; n = n->next) {
-            if (n->kind == ND_VAR_DECL && n->is_global && !n->init) {
-                out("global %s\n%s:\n    resb %d\n", n->asm_label, n->asm_label, type_size(n->type));
+            if (n->kind == ND_VAR_DECL && n->is_global && !n->is_extern_decl && !n->init) {
+                if (!n->is_file_static) out("global %s\n", n->asm_label);
+                out("%s:\n    resb %d\n", n->asm_label, type_size(n->type));
             }
         }
         for (int i = 0; i < g_n_statics; i++) {
             node_t *n = g_statics[i];
             if (!n->init) {
-                out("global %s\n%s:\n    resb %d\n", n->asm_label, n->asm_label, type_size(n->type));
+                out("%s:\n    resb %d\n", n->asm_label, type_size(n->type));
             }
         }
     }

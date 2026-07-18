@@ -1,29 +1,30 @@
 #!/usr/bin/env bash
 # Compiles each tests/toolchain/*.c fixture through CC (--target=host) +
-# AS, links with GNU ld (interim - LD doesn't exist until Phase T5), runs
-# it directly, and checks the exit code. Fast host-side iteration for the
-# compiler; kernel-target builtins (port I/O etc) are verified separately
-# via a QEMU boot, since they can't run on the host.
+# AS + LD (all our own tools as of Phase T5/T7), runs it directly, and
+# checks the exit code. Fast host-side iteration for the compiler;
+# kernel-target builtins (port I/O etc) are verified separately via a
+# QEMU boot, since they can't run on the host.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 CC=${CC_BIN:-build/toolchain/cc}
 AS=${AS_BIN:-build/toolchain/as}
+LD=${LD_BIN:-build/toolchain/ld}
 BUILD=build/toolchain_tests
 mkdir -p "$BUILD" build/toolchain
 
-# Not wired into the main Makefile yet (that's Phase T7) - bootstrap with
-# the host compiler if the tools haven't been built already.
+# Not wired into the main Makefile yet - bootstrap with the host compiler
+# if the tools haven't been built already (see docs/toolchain.md on the
+# one-time host-gcc bootstrap dependency).
 if [ ! -x "$CC" ]; then
-    gcc -Wall -Wextra -O2 -o "$CC" \
-        toolchain/cc/lexer.c toolchain/cc/preprocessor.c toolchain/cc/types.c \
-        toolchain/cc/parser.c toolchain/cc/codegen.c toolchain/cc/builtins.c toolchain/cc/main.c
+    gcc -Wall -Wextra -O2 -o "$CC" toolchain/cc/*.c
 fi
 if [ ! -x "$AS" ]; then
-    gcc -Wall -Wextra -O2 -o "$AS" \
-        toolchain/as/lexer.c toolchain/as/parser.c toolchain/as/encode.c \
-        toolchain/as/bin_writer.c toolchain/as/elf_writer.c toolchain/as/main.c
+    gcc -Wall -Wextra -O2 -o "$AS" toolchain/as/*.c
+fi
+if [ ! -x "$LD" ]; then
+    gcc -Wall -Wextra -O2 -o "$LD" toolchain/ld/*.c
 fi
 
 declare -A EXPECTED=(
@@ -33,6 +34,16 @@ declare -A EXPECTED=(
     [t03_recursion]=55
     [t04_pointers]=31
     [t05_structs]=17
+    [t06_switch]=139
+    [t07_comma]=53
+    [t08_forward_struct]=6
+    [t09_local_init]=81
+    [t10_short]=6
+    [t11_array_size]=155
+    [t12_local_array_size]=4
+    [t13_struct_copy]=212
+    [t14_struct_return]=44
+    [t15_escapes]=158
 )
 
 fail=0
@@ -46,7 +57,7 @@ for src in tests/toolchain/*.c; do
 
     "$CC" -I toolchain/include --target=host -o "$BUILD/$name.S" "$src"
     "$AS" -f elf32 -o "$BUILD/$name.o" "$BUILD/$name.S"
-    ld -m elf_i386 -o "$BUILD/$name" "$BUILD/$name.o"
+    "$LD" -o "$BUILD/$name" "$BUILD/$name.o"
 
     set +e
     "$BUILD/$name"
