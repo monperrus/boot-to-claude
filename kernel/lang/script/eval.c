@@ -47,6 +47,28 @@ typedef struct {
 
 static const value_t VAL_ZERO = { VAL_INT, { .i = 0 } };
 
+/* Constructors used in place of compound literals (`(value_t){...}`) -
+ * kept out of tinyC's dialect deliberately (see docs/toolchain.md): the
+ * feature was used in ~22 places in this file alone and implementing it
+ * in CC would mean parsing/lowering anonymous-temporary initializer
+ * lists for one file's convenience. Plain aggregate initialization of a
+ * file-scope variable (VAL_ZERO above) is a different, more basic
+ * feature and stays as-is - CC supports brace-init for globals/statics
+ * directly. */
+static value_t mkint(int32_t i) {
+    value_t v;
+    v.type = VAL_INT;
+    v.as.i = i;
+    return v;
+}
+
+static value_t mkstr(char *s) {
+    value_t v;
+    v.type = VAL_STR;
+    v.as.s = s;
+    return v;
+}
+
 static int env_find(env_t *env, const char *name) {
     for (int i = 0; i < env->count; i++) {
         if (strcmp(env->names[i], name) == 0) {
@@ -114,7 +136,7 @@ static value_t eval_binop(token_type_t op, value_t l, value_t r) {
         char lb[16], rb[16];
         const char *ls = (l.type == VAL_STR) ? l.as.s : itoa(l.as.i, lb, 10);
         const char *rs = (r.type == VAL_STR) ? r.as.s : itoa(r.as.i, rb, 10);
-        return (value_t){ VAL_STR, { .s = str_concat(ls, rs) } };
+        return mkstr(str_concat(ls, rs));
     }
     if (op == TOK_EQ || op == TOK_NEQ) {
         int eq;
@@ -125,21 +147,21 @@ static value_t eval_binop(token_type_t op, value_t l, value_t r) {
         } else {
             eq = 0;
         }
-        return (value_t){ VAL_INT, { .i = (op == TOK_EQ) ? eq : !eq } };
+        return mkint((op == TOK_EQ) ? eq : !eq);
     }
 
     int li = to_int(l);
     int ri = to_int(r);
     switch (op) {
-        case TOK_PLUS:    return (value_t){ VAL_INT, { .i = li + ri } };
-        case TOK_MINUS:   return (value_t){ VAL_INT, { .i = li - ri } };
-        case TOK_STAR:    return (value_t){ VAL_INT, { .i = li * ri } };
-        case TOK_SLASH:   return (value_t){ VAL_INT, { .i = ri != 0 ? li / ri : 0 } };
-        case TOK_PERCENT: return (value_t){ VAL_INT, { .i = ri != 0 ? li % ri : 0 } };
-        case TOK_LT:      return (value_t){ VAL_INT, { .i = li < ri } };
-        case TOK_LE:      return (value_t){ VAL_INT, { .i = li <= ri } };
-        case TOK_GT:      return (value_t){ VAL_INT, { .i = li > ri } };
-        case TOK_GE:      return (value_t){ VAL_INT, { .i = li >= ri } };
+        case TOK_PLUS:    return mkint(li + ri);
+        case TOK_MINUS:   return mkint(li - ri);
+        case TOK_STAR:    return mkint(li * ri);
+        case TOK_SLASH:   return mkint(ri != 0 ? li / ri : 0);
+        case TOK_PERCENT: return mkint(ri != 0 ? li % ri : 0);
+        case TOK_LT:      return mkint(li < ri);
+        case TOK_LE:      return mkint(li <= ri);
+        case TOK_GT:      return mkint(li > ri);
+        case TOK_GE:      return mkint(li >= ri);
         default:          return VAL_ZERO;
     }
 }
@@ -208,16 +230,16 @@ static value_t eval_call(interp_t *interp, env_t *env, ast_node_t *node) {
             buf[len] = '\0';
             char *out = kmalloc(len + 1);
             memcpy(out, buf, len + 1);
-            return (value_t){ VAL_STR, { .s = out } };
+            return mkstr(out);
         }
-        return (value_t){ VAL_STR, { .s = "" } };
+        return mkstr("");
     }
 
     if (strcmp(node->name, "fwrite") == 0 && argc >= 2 && args[0].type == VAL_STR) {
         const char *content = (args[1].type == VAL_STR) ? args[1].as.s : "";
         tinyfs_create(args[0].as.s); /* ignored if it already exists */
         int rc = tinyfs_write(args[0].as.s, content, (uint32_t)strlen(content));
-        return (value_t){ VAL_INT, { .i = rc == 0 } };
+        return mkint(rc == 0);
     }
 
     if (strcmp(node->name, "flist") == 0) {
@@ -229,7 +251,7 @@ static value_t eval_call(interp_t *interp, env_t *env, ast_node_t *node) {
             serial_write(entries[i].name);
             serial_write("\n");
         }
-        return (value_t){ VAL_INT, { .i = n } };
+        return mkint(n);
     }
 
     ast_node_t *def = find_func(interp, node->name);
@@ -251,9 +273,9 @@ static value_t eval_call(interp_t *interp, env_t *env, ast_node_t *node) {
 static value_t eval_expr(interp_t *interp, env_t *env, ast_node_t *node) {
     switch (node->kind) {
         case AST_NUM:
-            return (value_t){ VAL_INT, { .i = node->num } };
+            return mkint(node->num);
         case AST_STR:
-            return (value_t){ VAL_STR, { .s = node->str } };
+            return mkstr(node->str);
         case AST_VAR:
             return env_get(env, node->name);
         case AST_ASSIGN: {
@@ -264,9 +286,9 @@ static value_t eval_expr(interp_t *interp, env_t *env, ast_node_t *node) {
         case AST_UNOP: {
             value_t v = eval_expr(interp, env, node->a);
             if (node->op == TOK_MINUS) {
-                return (value_t){ VAL_INT, { .i = -to_int(v) } };
+                return mkint(-to_int(v));
             }
-            return (value_t){ VAL_INT, { .i = !to_int(v) } };
+            return mkint(!to_int(v));
         }
         case AST_BINOP: {
             if (node->op == TOK_AND) {
@@ -275,15 +297,15 @@ static value_t eval_expr(interp_t *interp, env_t *env, ast_node_t *node) {
                     return VAL_ZERO;
                 }
                 value_t r = eval_expr(interp, env, node->b);
-                return (value_t){ VAL_INT, { .i = to_int(r) != 0 } };
+                return mkint(to_int(r) != 0);
             }
             if (node->op == TOK_OR) {
                 value_t l = eval_expr(interp, env, node->a);
                 if (to_int(l)) {
-                    return (value_t){ VAL_INT, { .i = 1 } };
+                    return mkint(1);
                 }
                 value_t r = eval_expr(interp, env, node->b);
-                return (value_t){ VAL_INT, { .i = to_int(r) != 0 } };
+                return mkint(to_int(r) != 0);
             }
             value_t l = eval_expr(interp, env, node->a);
             value_t r = eval_expr(interp, env, node->b);

@@ -2,17 +2,15 @@
 
 #include <stdint.h>
 
+#include "builtins.h"
+
 #define COM1 0x3f8
 
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
+/* Thin names over the compiler's fixed port-I/O builtins (see
+ * docs/toolchain.md) - kept so the call sites below read the same as
+ * before rather than spelling out __builtin_* everywhere. */
+static inline void outb(uint16_t port, uint8_t val) { __builtin_outb(port, val); }
+static inline uint8_t inb(uint16_t port) { return __builtin_inb(port); }
 
 void serial_init(void) {
     outb(COM1 + 1, 0x00); /* disable interrupts */

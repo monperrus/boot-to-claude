@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "builtins.h"
 #include "console.h"
 #include "serial.h"
 #include "string.h"
@@ -40,7 +41,7 @@ void idt_init(void) {
         idt_set_gate(i, isr_stub_table[i]);
     }
 
-    __asm__ volatile ("lidt %0" : : "m"(idtp));
+    __builtin_lidt(&idtp);
 }
 
 /* Called from idt_stubs.S. Never returns - the stub halts right after. */

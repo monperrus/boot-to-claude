@@ -35,6 +35,16 @@ int strcmp(const char *a, const char *b) {
     return (unsigned char)*a - (unsigned char)*b;
 }
 
+char *strchr(const char *s, int c) {
+    while (*s) {
+        if (*s == (char)c) {
+            return (char *)s;
+        }
+        s++;
+    }
+    return c == '\0' ? (char *)s : NULL;
+}
+
 char *itoa(int value, char *buf, int base) {
     char tmp[34];
     int i = 0;

@@ -192,9 +192,10 @@ never brace-initializes a plain stack local, only scalars, so codegen
 never needs to lower a brace list into runtime store instructions.
 Compound literals (`(type){...}`) and designated initializers
 (`[i] = x`, `.field = x`) aren't supported at all - the two call sites
-that used them (`kernel/lang/script/eval.c`, `kernel/lang/compiler/
-codegen.c`) get refactored to avoid them in Phase T3, a deliberate
-scope-narrowing decision (see the plan) rather than an oversight.
+that used them (`kernel/lang/script/eval.c`'s `mkint`/`mkstr`
+constructors, `kernel/lang/compiler/codegen.c`'s `binop_opcode`
+function) were refactored to avoid them in Phase T3, a deliberate
+scope-narrowing decision rather than an oversight.
 
 ### Codegen
 
@@ -254,6 +255,40 @@ COM1's line-status register and writes bytes via `__builtin_inb`/
 `__builtin_outb`, linked with the *real* `kernel/entry.S` and booted
 through the *real* `boot.S`/`stage2.S` in QEMU, printed its expected
 output over serial.
+
+## Kernel source adaptation (Phase T3)
+
+The kernel source now expresses every low-level operation the way CC
+expects it, ahead of Phase T7's actual switchover - so this phase's
+changes are visible today even though the build still uses host
+gcc/nasm/ld/objcopy:
+
+- All 12 inline-asm sites (`kernel/{ata,serial,keyboard,idt,gdt}.c`,
+  `kernel/shell/shell.c`) now call named builtins declared in
+  `kernel/builtins.h` (`__builtin_outb`/`inb`/`outw`/`inw`/`hlt`/
+  `lidt`/`gdt_flush`) instead of raw `__asm__` blocks.
+- `tools/mkfs_tinyfs.c` is libc-free: raw `__sys_open`/`read`/`write`/
+  `lseek`/`close`/`exit` (declared in `tools/host_syscalls.h`) instead
+  of `fopen`/`fread`/`fwrite`/`fseek`/`fclose`/`exit`/`perror`, and
+  `kernel/string.h` instead of the system `<string.h>` (which needed
+  adding `strchr` there, used to split `host-path:fs-name` seed specs).
+
+Since GCC doesn't recognize any of these names as its own builtins, real
+GCC-inline-asm bodies live in two small shim files -
+`kernel/builtins_shim.c` and `tools/host_syscalls_shim.c` - that exist
+*only* so the current interim build still links. Both get dropped from
+the Makefile in Phase T7: CC intercepts every call to these names
+directly in codegen and never needs (or could parse - CC has no
+inline-asm support at all) a linkable definition. The "Builtins" section
+above documents the actual instruction sequences CC emits for each one;
+the shims mirror them exactly (e.g. `__sys_open`'s hardcoded mode `420`)
+so behavior is identical either way.
+
+Verified with the *existing* toolchain, deliberately - this phase proves
+the refactor is behavior-preserving before the new toolchain is even in
+the loop: `tools/run_tests.sh` (full OS boot + shell + both languages)
+and `tools/run_toolchain_tests.sh` (CC's own test battery) both stay
+green throughout, built entirely with gcc/nasm/ld/objcopy as before.
 
 ## LD, OBJCOPY
 

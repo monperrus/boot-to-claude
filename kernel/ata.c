@@ -1,4 +1,5 @@
 #include "ata.h"
+#include "builtins.h"
 
 #define ATA_IO_BASE   0x1F0
 #define ATA_DATA      (ATA_IO_BASE + 0)
@@ -17,25 +18,13 @@
 #define ATA_SR_BSY 0x80
 #define ATA_SR_DRQ 0x08
 
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
-
-static inline void outw(uint16_t port, uint16_t val) {
-    __asm__ volatile ("outw %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint16_t inw(uint16_t port) {
-    uint16_t ret;
-    __asm__ volatile ("inw %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
+/* Thin names over the compiler's fixed port-I/O builtins (see
+ * docs/toolchain.md) - kept so the many call sites below read the same
+ * as before rather than spelling out __builtin_* everywhere. */
+static inline void outb(uint16_t port, uint8_t val) { __builtin_outb(port, val); }
+static inline uint8_t inb(uint16_t port) { return __builtin_inb(port); }
+static inline void outw(uint16_t port, uint16_t val) { __builtin_outw(port, val); }
+static inline uint16_t inw(uint16_t port) { return __builtin_inw(port); }
 
 static void ata_wait_bsy(void) {
     while (inb(ATA_STATUS) & ATA_SR_BSY) {}

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "builtins.h"
 #include "console.h"
 #include "fs/tinyfs.h"
 #include "keyboard.h"
@@ -14,15 +15,8 @@
 
 #define LINE_MAX 128
 
-static inline void outb(uint16_t port, uint8_t val) {
-    __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
-}
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
+static inline void outb(uint16_t port, uint8_t val) { __builtin_outb(port, val); }
+static inline uint8_t inb(uint16_t port) { return __builtin_inb(port); }
 
 static void echo_char(char c) {
     console_putc(c);
@@ -205,7 +199,7 @@ static void cmd_reboot(void) {
     } while (status & 0x02);
     outb(0x64, 0xFE); /* pulse the keyboard controller's reset line */
     for (;;) {
-        __asm__ volatile ("hlt");
+        __builtin_hlt();
     }
 }
 

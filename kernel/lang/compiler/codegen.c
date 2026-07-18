@@ -158,13 +158,28 @@ static void compile_var_store(compiler_t *c, const char *name) {
     }
 }
 
-static const bc_opcode_t BINOP_TABLE[] = {
-    [TOK_PLUS] = OP_ADD, [TOK_MINUS] = OP_SUB, [TOK_STAR] = OP_MUL,
-    [TOK_SLASH] = OP_DIV, [TOK_PERCENT] = OP_MOD,
-    [TOK_EQ] = OP_EQ, [TOK_NEQ] = OP_NEQ,
-    [TOK_LT] = OP_LT, [TOK_LE] = OP_LE, [TOK_GT] = OP_GT, [TOK_GE] = OP_GE,
-    [TOK_AND] = OP_AND, [TOK_OR] = OP_OR,
-};
+/* Explicit dispatch in place of a designated-initializer lookup table
+ * (`[TOK_PLUS] = OP_ADD, ...`) - kept out of tinyC's dialect deliberately
+ * (see docs/toolchain.md): implementing designated initializers in CC
+ * for this one table isn't worth the added parser/codegen complexity. */
+static int binop_opcode(token_type_t op, bc_opcode_t *out) {
+    switch (op) {
+        case TOK_PLUS:    *out = OP_ADD; return 1;
+        case TOK_MINUS:   *out = OP_SUB; return 1;
+        case TOK_STAR:    *out = OP_MUL; return 1;
+        case TOK_SLASH:   *out = OP_DIV; return 1;
+        case TOK_PERCENT: *out = OP_MOD; return 1;
+        case TOK_EQ:      *out = OP_EQ; return 1;
+        case TOK_NEQ:     *out = OP_NEQ; return 1;
+        case TOK_LT:      *out = OP_LT; return 1;
+        case TOK_LE:      *out = OP_LE; return 1;
+        case TOK_GT:      *out = OP_GT; return 1;
+        case TOK_GE:      *out = OP_GE; return 1;
+        case TOK_AND:     *out = OP_AND; return 1;
+        case TOK_OR:      *out = OP_OR; return 1;
+        default:          return 0;
+    }
+}
 
 static void compile_expr(compiler_t *c, ast_node_t *node) {
     switch (node->kind) {
@@ -190,11 +205,12 @@ static void compile_expr(compiler_t *c, ast_node_t *node) {
         case AST_BINOP: {
             compile_expr(c, node->a);
             compile_expr(c, node->b);
-            if ((size_t)node->op >= sizeof(BINOP_TABLE) / sizeof(BINOP_TABLE[0])) {
+            bc_opcode_t op;
+            if (!binop_opcode(node->op, &op)) {
                 compile_error(c, "unsupported operator");
                 return;
             }
-            emit_op(c, BINOP_TABLE[node->op]);
+            emit_op(c, op);
             return;
         }
         case AST_CALL: {

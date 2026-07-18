@@ -41,8 +41,9 @@ One bit per data block, index 0 = first data block (fs block 10).
 ## API (`kernel/fs/tinyfs.c`)
 
 `tinyfs_init(read_fn, write_fn)` wires in the block I/O backend (ATA PIO in
-the kernel, `fopen`/`fseek`/`fwrite` on the host). `tinyfs_format` is only
-ever called by `mkfs_tinyfs`. The kernel calls `tinyfs_mount`, then
+the kernel, raw `__sys_lseek`/`__sys_read`/`__sys_write` syscalls on the
+host - see `tools/mkfs_tinyfs.c` and `docs/toolchain.md`). `tinyfs_format`
+is only ever called by `mkfs_tinyfs`. The kernel calls `tinyfs_mount`, then
 `tinyfs_create` / `tinyfs_read` / `tinyfs_write` / `tinyfs_delete` /
 `tinyfs_list`.
 

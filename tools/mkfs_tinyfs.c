@@ -2,31 +2,46 @@
  * seeds it with initial files. Not part of the OS - infrastructure, like
  * the assembler/linker/QEMU, run at build time on the host. Reuses
  * kernel/fs/tinyfs.c verbatim (compiled natively here, freestanding in
- * the kernel) so there is exactly one implementation of the fs format. */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+ * the kernel) so there is exactly one implementation of the fs format.
+ *
+ * Libc-free: uses only the __sys_* raw-syscall names CC's builtins.c
+ * intercepts directly at the call site (see docs/toolchain.md), and
+ * kernel/string.h instead of the system <string.h>, so this file
+ * compiles unchanged once Phase T7 switches the build to CC. Under the
+ * current interim GCC-based build, __sys_open/read/write/lseek/close/
+ * exit need real definitions to link against - see
+ * tools/host_syscalls_shim.c (dropped once CC takes over, same as
+ * kernel/builtins_shim.c - CC intercepts every call site directly and
+ * couldn't even parse that shim's inline asm). */
 
 #include "../kernel/fs/tinyfs.h"
+#include "../kernel/string.h"
+#include "host_syscalls.h"
 
-static FILE *disk;
+#define O_RDONLY 0
+#define O_RDWR   2
+#define SEEK_SET 0
+
+static void die(const char *msg) {
+    __sys_write(2, msg, strlen(msg));
+    __sys_exit(1);
+}
+
+static int g_disk_fd;
 
 static void disk_block_read(uint32_t block, void *buf) {
     long offset = (long)(TINYFS_FS_START_LBA + block) * TINYFS_BLOCK_SIZE;
-    if (fseek(disk, offset, SEEK_SET) != 0 ||
-        fread(buf, 1, TINYFS_BLOCK_SIZE, disk) != TINYFS_BLOCK_SIZE) {
-        fprintf(stderr, "mkfs_tinyfs: read failed at block %u\n", block);
-        exit(1);
+    if (__sys_lseek(g_disk_fd, (int)offset, SEEK_SET) < 0 ||
+        __sys_read(g_disk_fd, buf, TINYFS_BLOCK_SIZE) != TINYFS_BLOCK_SIZE) {
+        die("mkfs_tinyfs: disk read failed\n");
     }
 }
 
 static void disk_block_write(uint32_t block, const void *buf) {
     long offset = (long)(TINYFS_FS_START_LBA + block) * TINYFS_BLOCK_SIZE;
-    if (fseek(disk, offset, SEEK_SET) != 0 ||
-        fwrite(buf, 1, TINYFS_BLOCK_SIZE, disk) != TINYFS_BLOCK_SIZE) {
-        fprintf(stderr, "mkfs_tinyfs: write failed at block %u\n", block);
-        exit(1);
+    if (__sys_lseek(g_disk_fd, (int)offset, SEEK_SET) < 0 ||
+        __sys_write(g_disk_fd, buf, TINYFS_BLOCK_SIZE) != TINYFS_BLOCK_SIZE) {
+        die("mkfs_tinyfs: disk write failed\n");
     }
 }
 
@@ -39,14 +54,16 @@ static void seed_file(const char *name, const char *contents) {
  * tests/ so their source lives in one place instead of being duplicated
  * as a C string literal here. */
 static void seed_file_from_host(const char *host_path, const char *fs_name) {
-    FILE *f = fopen(host_path, "rb");
-    if (!f) {
-        fprintf(stderr, "mkfs_tinyfs: cannot open seed file %s\n", host_path);
-        exit(1);
+    int fd = __sys_open(host_path, O_RDONLY);
+    if (fd < 0) {
+        die("mkfs_tinyfs: cannot open seed file\n");
     }
-    char buf[TINYFS_MAX_FILE_SIZE];
-    size_t n = fread(buf, 1, sizeof(buf), f);
-    fclose(f);
+    static char buf[TINYFS_MAX_FILE_SIZE];
+    int n = __sys_read(fd, buf, sizeof(buf));
+    __sys_close(fd);
+    if (n < 0) {
+        die("mkfs_tinyfs: cannot read seed file\n");
+    }
 
     tinyfs_create(fs_name);
     tinyfs_write(fs_name, buf, (uint32_t)n);
@@ -54,14 +71,12 @@ static void seed_file_from_host(const char *host_path, const char *fs_name) {
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "usage: %s <disk-image> [host-path:fs-name ...]\n", argv[0]);
-        return 1;
+        die("usage: mkfs_tinyfs <disk-image> [host-path:fs-name ...]\n");
     }
 
-    disk = fopen(argv[1], "r+b");
-    if (!disk) {
-        perror("fopen");
-        return 1;
+    g_disk_fd = __sys_open(argv[1], O_RDWR);
+    if (g_disk_fd < 0) {
+        die("mkfs_tinyfs: cannot open disk image\n");
     }
 
     tinyfs_init(disk_block_read, disk_block_write);
@@ -70,25 +85,23 @@ int main(int argc, char **argv) {
     seed_file("hello.txt", "Hello, tinyfs!\n");
 
     for (int i = 2; i < argc; i++) {
-        char spec[256];
+        static char spec[256];
         size_t speclen = strlen(argv[i]);
         if (speclen >= sizeof(spec)) {
-            fprintf(stderr, "mkfs_tinyfs: seed spec too long: %s\n", argv[i]);
-            return 1;
+            die("mkfs_tinyfs: seed spec too long\n");
         }
         memcpy(spec, argv[i], speclen + 1);
 
         char *sep = strchr(spec, ':');
         if (!sep) {
-            fprintf(stderr, "mkfs_tinyfs: bad seed spec %s (want host-path:fs-name)\n", argv[i]);
-            return 1;
+            die("mkfs_tinyfs: bad seed spec (want host-path:fs-name)\n");
         }
         *sep = '\0';
         seed_file_from_host(spec, sep + 1);
     }
 
-    fclose(disk);
-    printf("mkfs_tinyfs: formatted %s (%u data blocks available)\n",
-           argv[1], (unsigned)TINYFS_DATA_BLOCKS);
+    __sys_close(g_disk_fd);
+    __sys_write(1, "mkfs_tinyfs: done\n", 19);
+    __sys_exit(0);
     return 0;
 }

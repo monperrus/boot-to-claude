@@ -2,6 +2,8 @@
 
 #include <stdint.h>
 
+#include "builtins.h"
+
 /* The kernel owns its GDT rather than relying on the one stage2 built on
  * the real-mode stack - stage2's copy happens to still be valid at this
  * point, but the kernel should not depend on bootloader memory. */
@@ -40,18 +42,5 @@ void gdt_init(void) {
     gdt_set_gate(1, 0, 0xFFFFF, 0x9A, 0xC0); /* 0x08: code, ring0, 4GB flat */
     gdt_set_gate(2, 0, 0xFFFFF, 0x92, 0xC0); /* 0x10: data, ring0, 4GB flat */
 
-    __asm__ volatile (
-        "lgdt %0\n"
-        "mov $0x10, %%ax\n"
-        "mov %%ax, %%ds\n"
-        "mov %%ax, %%es\n"
-        "mov %%ax, %%fs\n"
-        "mov %%ax, %%gs\n"
-        "mov %%ax, %%ss\n"
-        "ljmp $0x08, $1f\n"
-        "1:\n"
-        :
-        : "m"(gdtp)
-        : "eax"
-    );
+    __builtin_gdt_flush(&gdtp);
 }

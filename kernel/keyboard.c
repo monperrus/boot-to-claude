@@ -3,17 +3,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "builtins.h"
+
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
 
 #define SC_LSHIFT 0x2A
 #define SC_RSHIFT 0x36
 
-static inline uint8_t inb(uint16_t port) {
-    uint8_t ret;
-    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
-    return ret;
-}
+static inline uint8_t inb(uint16_t port) { return __builtin_inb(port); }
 
 /* Scancode set 1, indexed by make code. 0 = unmapped/non-printable. */
 static const char lower_table[] = {

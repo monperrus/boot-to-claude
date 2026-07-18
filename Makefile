@@ -23,7 +23,7 @@ DISK_IMG   := $(BUILD)/disk.img
 KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c kernel/gdt.c \
                  kernel/idt.c kernel/string.c kernel/memory.c kernel/selftest.c \
                  kernel/ata.c kernel/fs/tinyfs.c kernel/fs/tinyfs_disk.c \
-                 kernel/keyboard.c kernel/shell/shell.c \
+                 kernel/keyboard.c kernel/shell/shell.c kernel/builtins_shim.c \
                  kernel/lang/lexer.c kernel/lang/script/ast.c \
                  kernel/lang/script/parser.c kernel/lang/script/eval.c \
                  kernel/lang/compiler/parser.c kernel/lang/compiler/codegen.c \
@@ -34,8 +34,15 @@ KERNEL_OBJS   := $(patsubst kernel/%.S,$(BUILD)/%.o,$(KERNEL_ASM_SRCS)) \
 KERNEL_ELF    := $(BUILD)/kernel.elf
 KERNEL_BIN    := $(BUILD)/kernel.bin
 
+HOSTCFLAGS := -m32 -Wall -Wextra -O2 -Ikernel
+
 MKFS_BIN := $(BUILD)/mkfs_tinyfs
-MKFS_OBJS := $(BUILD)/host_tinyfs.o $(BUILD)/host_mkfs_tinyfs.o
+# host_string.o: kernel/string.c compiled natively - host tools are
+# libc-free (see docs/toolchain.md), same as the kernel itself.
+# host_syscalls_shim.o: real int 0x80 bodies for the interim GCC build
+# only, dropped once Phase T7 switches to CC (see tools/host_syscalls.h).
+MKFS_OBJS := $(BUILD)/host_tinyfs.o $(BUILD)/host_string.o \
+             $(BUILD)/host_syscalls_shim.o $(BUILD)/host_mkfs_tinyfs.o
 # host-path:fs-name pairs seeded into every disk image; the host paths
 # alone are listed separately so they can be used as make prerequisites
 MKFS_SEED_FILES := tests/hello.tsh tests/hello.tc
@@ -75,15 +82,24 @@ $(KERNEL_BIN): $(KERNEL_ELF)
 	fi
 
 # --- host-side mkfs tool (build-time infrastructure, not kernel code) ---
+# -m32: matches CC's x86-32-only codegen, so tools/host_syscalls_shim.c's
+# int 0x80 convention is correct and this build stays consistent with
+# what Phase T7 will produce.
 
 $(BUILD)/host_tinyfs.o: kernel/fs/tinyfs.c | $(BUILD)
-	$(HOSTCC) -Wall -Wextra -O2 -c -o $@ $<
+	$(HOSTCC) $(HOSTCFLAGS) -c -o $@ $<
+
+$(BUILD)/host_string.o: kernel/string.c | $(BUILD)
+	$(HOSTCC) $(HOSTCFLAGS) -c -o $@ $<
+
+$(BUILD)/host_syscalls_shim.o: tools/host_syscalls_shim.c | $(BUILD)
+	$(HOSTCC) $(HOSTCFLAGS) -c -o $@ $<
 
 $(BUILD)/host_mkfs_tinyfs.o: tools/mkfs_tinyfs.c | $(BUILD)
-	$(HOSTCC) -Wall -Wextra -O2 -c -o $@ $<
+	$(HOSTCC) $(HOSTCFLAGS) -c -o $@ $<
 
 $(MKFS_BIN): $(MKFS_OBJS)
-	$(HOSTCC) -o $@ $(MKFS_OBJS)
+	$(HOSTCC) -m32 -o $@ $(MKFS_OBJS)
 
 $(DISK_IMG): $(BOOT_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(MKFS_BIN) $(MKFS_SEED_FILES)
 	dd if=/dev/zero of=$@ bs=512 count=$(DISK_SECTORS) status=none
