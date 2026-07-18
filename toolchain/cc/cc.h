@@ -147,6 +147,10 @@ struct node {
     int is_static_local;     /* function-local `static` - lives in .data/.bss, own label */
     int frame_offset;          /* local/param: EBP-relative byte offset */
     char asm_label[MAX_NAME];   /* global / static-local: the label CC emits for it */
+    int is_indirect_call;         /* ND_CALL: callee is a function-pointer variable
+                                    * (the fields above locate it), not a directly
+                                    * callable function symbol - `call eax` instead
+                                    * of `call name` */
 
     node_t *init;      /* ND_VAR_DECL: initializer expression or {..} list (via ->list), or NULL */
     int is_extern_decl;

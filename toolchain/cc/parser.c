@@ -41,12 +41,15 @@ typedef struct {
     int had_error;
 } parser_t;
 
-static void perr(parser_t *p, const char *msg) {
-    token_t t = p->toks[p->pos];
+static void perr_at(parser_t *p, token_t t, const char *msg) {
     fprintf(stderr, "cc: %s:%d: %s (near '%s')\n", t.file ? t.file : "?", t.line, msg,
             t.kind == TK_IDENT || t.kind == TK_STR ? t.text : "?");
     p->had_error = 1;
     exit(1); /* tinyC has no error recovery - not worth it for this codebase's size */
+}
+
+static void perr(parser_t *p, const char *msg) {
+    perr_at(p, p->toks[p->pos], msg);
 }
 
 static token_t cur(parser_t *p) { return p->toks[p->pos]; }
@@ -166,7 +169,7 @@ static member_t *parse_struct_members(parser_t *p);
 
 static int is_type_start(parser_t *p) {
     if (!check(p, TK_IDENT)) return 0;
-    const char *kws[] = { "void", "char", "short", "int", "signed", "unsigned",
+    const char *kws[] = { "void", "char", "short", "int", "long", "signed", "unsigned",
                            "struct", "union", "enum", "const", "volatile", "static", "extern", NULL };
     for (int i = 0; kws[i]; i++) if (strcmp(cur(p).text, kws[i]) == 0) return 1;
     return is_typedef_name(p, cur(p).text);
@@ -175,7 +178,7 @@ static int is_type_start(parser_t *p) {
 /* Parses base type specifiers + storage class; returns the type and sets
  * is_static and is_extern. Does not consume any declarator. */
 static type_t *parse_type_spec(parser_t *p, int *is_static, int *is_extern) {
-    int saw_void = 0, saw_char = 0, saw_short = 0, saw_int = 0, saw_unsigned = 0, saw_signed = 0;
+    int saw_void = 0, saw_char = 0, saw_short = 0, saw_int = 0, saw_long = 0, saw_unsigned = 0, saw_signed = 0;
     type_t *named = NULL;
     if (is_static) *is_static = 0;
     if (is_extern) *is_extern = 0;
@@ -188,6 +191,10 @@ static type_t *parse_type_spec(parser_t *p, int *is_static, int *is_extern) {
         if (match_kw(p, "char")) { saw_char = 1; continue; }
         if (match_kw(p, "short")) { saw_short = 1; continue; }
         if (match_kw(p, "int")) { saw_int = 1; continue; }
+        /* long == int on this 32-bit target (both 4 bytes) - no `long
+         * long`/`unsigned long` anywhere in the codebase (see
+         * docs/toolchain.md), so a same-size alias is enough. */
+        if (match_kw(p, "long")) { saw_long = 1; continue; }
         if (match_kw(p, "signed")) { saw_signed = 1; continue; }
         if (match_kw(p, "unsigned")) { saw_unsigned = 1; continue; }
         if (is_kw(p, "struct") || is_kw(p, "union")) {
@@ -269,7 +276,7 @@ static type_t *parse_type_spec(parser_t *p, int *is_static, int *is_extern) {
             named = et;
             continue;
         }
-        if (check(p, TK_IDENT) && is_typedef_name(p, cur(p).text) && !named && !saw_void && !saw_char && !saw_short && !saw_int) {
+        if (check(p, TK_IDENT) && is_typedef_name(p, cur(p).text) && !named && !saw_void && !saw_char && !saw_short && !saw_int && !saw_long) {
             sym_t *s = sym_find_global(p, cur(p).text);
             named = s->type;
             advance(p);
@@ -426,9 +433,9 @@ static node_t *make_num(int64_t v) {
     return n;
 }
 
-static node_t *resolve_ident(parser_t *p, const char *name) {
+static node_t *resolve_ident(parser_t *p, const char *name, token_t at) {
     sym_t *s = sym_find(p, name);
-    if (!s) { perr(p, "undeclared identifier"); return make_num(0); }
+    if (!s) { perr_at(p, at, "undeclared identifier"); return make_num(0); }
     if (s->is_enum_const) return make_num(s->enum_value);
     node_t *n = node_new(ND_VAR);
     safe_strcpy(n->name, name, MAX_NAME);
@@ -462,7 +469,8 @@ static node_t *parse_primary(parser_t *p) {
     if (check(p, TK_STR)) { return make_str(p, advance(p).text); }
     if (check(p, TK_IDENT)) {
         char name[MAX_NAME];
-        safe_strcpy(name, advance(p).text, MAX_NAME);
+        token_t ident_tok = advance(p);
+        safe_strcpy(name, ident_tok.text, MAX_NAME);
         if (check(p, TK_LPAREN)) {
             advance(p);
             node_t *call = node_new(ND_CALL);
@@ -477,9 +485,27 @@ static node_t *parse_primary(parser_t *p) {
             expect(p, TK_RPAREN);
             sym_t *fs = sym_find_global(p, name);
             call->type = (fs && fs->type->kind == TY_FUNC) ? fs->type->base : g_int_type;
+            if (!(fs && fs->type->kind == TY_FUNC)) {
+                /* Not a directly-defined function - if it resolves to a
+                 * variable (local or global) instead, this is a call
+                 * through a function-pointer value (e.g. tinyfs_init's
+                 * read_fn/write_fn callbacks), not a direct `call name`.
+                 * Locate the pointer the same way an ordinary variable
+                 * reference would (see resolve_ident/codegen_addr) so
+                 * codegen can load its value and `call eax`. */
+                sym_t *vs = sym_find(p, name);
+                if (vs && vs->type->kind == TY_PTR && vs->type->base->kind == TY_FUNC) {
+                    call->is_indirect_call = 1;
+                    call->is_global = vs->is_global;
+                    call->is_static_local = vs->is_static_local;
+                    call->frame_offset = vs->frame_offset;
+                    safe_strcpy(call->asm_label, vs->asm_label, MAX_NAME);
+                    call->type = vs->type->base->base;
+                }
+            }
             return call;
         }
-        return resolve_ident(p, name);
+        return resolve_ident(p, name, ident_tok);
     }
     if (match(p, TK_LPAREN)) {
         node_t *n = parse_expr(p);

@@ -500,6 +500,17 @@ static void parse_rest_of_line(pstate_t *ps, line_t *ln) {
             line_next(ln);
             st.ops[1] = parse_operand(ps, ln);
             st.nops = 2;
+            /* only `imul r32, r/m32, imm32` uses a 3rd operand - without
+             * this, a trailing `, imm` was silently dropped (never
+             * consumed, never reported as an error) and the immediate
+             * scale factor was lost, e.g. `imul ecx, ecx, 4` for array
+             * indexing silently became `imul ecx, ecx` (self-square
+             * instead of *4) - see docs/toolchain.md. */
+            if (line_peek(ln).kind == TK_COMMA) {
+                line_next(ln);
+                st.ops[2] = parse_operand(ps, ln);
+                st.nops = 3;
+            }
         }
     }
     push_stmt(ps, st);

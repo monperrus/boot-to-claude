@@ -15,10 +15,24 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "-I") == 0 && i + 1 < argc) {
             if (g_n_include_dirs < MAX_INCLUDE_DIRS) g_include_dirs[g_n_include_dirs++] = argv[++i];
         }
+        else if (strncmp(argv[i], "-I", 2) == 0 && argv[i][2] != '\0') {
+            /* gcc-compatible combined form (-Ikernel, no space) - the
+             * real Makefile's CFLAGS uses exactly this form. */
+            if (g_n_include_dirs < MAX_INCLUDE_DIRS) g_include_dirs[g_n_include_dirs++] = argv[i] + 2;
+        }
         else if (strncmp(argv[i], "--target=", 9) == 0) {
             target = strcmp(argv[i] + 9, "host") == 0 ? TARGET_HOST : TARGET_KERNEL;
         }
         else if (strcmp(argv[i], "--parse-only") == 0) { parse_only = 1; }
+        else if (strcmp(argv[i], "-c") == 0) { /* implied: one file in, one .S out - accepted, no-op */ }
+        else if (argv[i][0] == '-') {
+            /* Tolerate the rest of a real compiler invocation's flags
+             * (-Wall, -O2, -std=c11, -m32, -ffreestanding, ...) rather
+             * than erroring or (worse) mistaking one for the input
+             * file - the Makefile passes these unchanged either way,
+             * since CC is meant to be a drop-in gcc replacement for
+             * this project's exact build commands (see docs/toolchain.md). */
+        }
         else { inpath = argv[i]; }
     }
     if (!inpath) {

@@ -93,6 +93,32 @@ static void emit(token_t *out, int *out_n, int cap, token_t t) {
     out[(*out_n)++] = t;
 }
 
+/* Fully recursive macro expansion (object-like macros only - see
+ * docs/toolchain.md): a macro body token that is itself a macro name gets
+ * expanded too, not just one level (needed for e.g. tinyfs.h's
+ * TINYFS_DATA_BLOCK -> (TINYFS_INODE_BLOCK + TINYFS_INODE_BLOCKS) ->
+ * TINYFS_INODE_BLOCK -> (TINYFS_BITMAP_BLOCK + ...)). `active` tracks
+ * macros currently being expanded on this call stack, so a macro can't
+ * expand into itself (directly or via another macro) and recurse forever. */
+static void expand_macro_token(token_t t, token_t *out, int *out_n, int cap) {
+    static const macro_t *active[MAX_MACROS];
+    static int n_active = 0;
+
+    macro_t *m = macro_find(t.text);
+    if (!m) { emit(out, out_n, cap, t); return; }
+    for (int i = 0; i < n_active; i++) {
+        if (active[i] == m) { emit(out, out_n, cap, t); return; }
+    }
+
+    active[n_active++] = m;
+    for (int i = 0; i < m->n; i++) {
+        token_t bt = m->body[i];
+        if (bt.kind == TK_IDENT) expand_macro_token(bt, out, out_n, cap);
+        else emit(out, out_n, cap, bt);
+    }
+    n_active--;
+}
+
 static void process_lexer(lexer_t *lx, const char *filename, token_t *out, int *out_n, int cap, int depth) {
     char cur_dir[512];
     dirname_of(filename, cur_dir, sizeof(cur_dir));
@@ -120,11 +146,18 @@ static void process_lexer(lexer_t *lx, const char *filename, token_t *out, int *
                     if (depth >= MAX_INCLUDE_DEPTH) { fprintf(stderr, "cc: #include nested too deep\n"); exit(1); }
                     char *src = read_file(resolved);
                     if (!src) { fprintf(stderr, "cc: cannot open %s\n", resolved); exit(1); }
-                    static char paths[MAX_INCLUDE_DEPTH][600];
-                    safe_strcpy(paths[depth], resolved, sizeof(paths[depth]));
+                    /* Each include gets its own permanently-allocated path
+                     * buffer - token_t.file stores this pointer directly
+                     * (no copy), and sibling #includes at the same depth
+                     * would otherwise share (and overwrite) one static
+                     * per-depth buffer, retroactively corrupting the
+                     * filename of every already-emitted token from an
+                     * earlier sibling. */
+                    char *owned_path = malloc(strlen(resolved) + 1);
+                    strcpy(owned_path, resolved);
                     lexer_t sub;
-                    lexer_init(&sub, src, paths[depth]);
-                    process_lexer(&sub, paths[depth], out, out_n, cap, depth + 1);
+                    lexer_init(&sub, src, owned_path);
+                    process_lexer(&sub, owned_path, out, out_n, cap, depth + 1);
                 }
                 continue;
             }
@@ -167,17 +200,7 @@ static void process_lexer(lexer_t *lx, const char *filename, token_t *out, int *
         if (t.kind == TK_IDENT) {
             macro_t *m = macro_find(t.text);
             if (m) {
-                for (int i = 0; i < m->n; i++) {
-                    token_t bt = m->body[i];
-                    if (bt.kind == TK_IDENT) {
-                        macro_t *nested = macro_find(bt.text);
-                        if (nested && nested != m) {
-                            for (int j = 0; j < nested->n; j++) emit(out, out_n, cap, nested->body[j]);
-                            continue;
-                        }
-                    }
-                    emit(out, out_n, cap, bt);
-                }
+                expand_macro_token(t, out, out_n, cap);
                 continue;
             }
         }

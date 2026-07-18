@@ -65,14 +65,21 @@ static void store_value(type_t *t) {
 
 /* ---------------- lvalue addresses ---------------- */
 
+/* Address of a variable-like storage location, given the is_global/
+ * is_static_local/frame_offset/asm_label fields ND_VAR and an indirect
+ * ND_CALL's callee both carry (see cc.h). */
+static void codegen_var_addr(node_t *n) {
+    if (n->is_global || n->is_static_local) {
+        out("    lea eax, [%s]\n", n->asm_label);
+    } else {
+        out("    lea eax, [ebp%+d]\n", n->frame_offset);
+    }
+}
+
 static void codegen_addr(node_t *n) {
     switch (n->kind) {
         case ND_VAR:
-            if (n->is_global || n->is_static_local) {
-                out("    lea eax, [%s]\n", n->asm_label);
-            } else {
-                out("    lea eax, [ebp%+d]\n", n->frame_offset);
-            }
+            codegen_var_addr(n);
             return;
         case ND_MEMBER:
             codegen_addr(n->a);
@@ -151,7 +158,12 @@ static void codegen_expr(node_t *n) {
             return;
         case ND_VAR:
             codegen_addr(n);
-            load_value(n->type);
+            /* A bare function name (e.g. passed as a callback: tinyfs_init(
+             * disk_block_read, ...)) decays to its own address - there's no
+             * separate "function value" stored anywhere to load, unlike an
+             * ordinary global whose address holds its value. Loading here
+             * would dereference the function's own machine code bytes. */
+            if (n->type->kind != TY_FUNC) load_value(n->type);
             return;
         case ND_ASSIGN: {
             codegen_addr(n->a);
@@ -288,7 +300,7 @@ extern int builtin_emit_call(const char *name, node_t *args, cc_target_t target,
                               void (*emit_arg)(node_t *), void (*emitf)(const char *, ...));
 
 static void codegen_call_or_builtin(node_t *n) {
-    if (builtin_emit_call(n->name, n->list, g_target, codegen_expr, out)) return;
+    if (!n->is_indirect_call && builtin_emit_call(n->name, n->list, g_target, codegen_expr, out)) return;
 
     int argc = 0;
     node_t *args[16];
@@ -297,7 +309,19 @@ static void codegen_call_or_builtin(node_t *n) {
         codegen_expr(args[i]);
         out("    push eax\n");
     }
-    out("    call %s\n", n->name);
+    if (n->is_indirect_call) {
+        /* Callee is a function-pointer variable (e.g. tinyfs_init's
+         * read_fn/write_fn callbacks), not a directly callable symbol -
+         * load its stored address (always a plain 4-byte pointer, so no
+         * load_value/is_byte_type dance needed) and call through it.
+         * Done last, after all args are already pushed, so this doesn't
+         * need to protect eax from being clobbered by arg evaluation. */
+        codegen_var_addr(n);
+        out("    mov eax, [eax]\n");
+        out("    call eax\n");
+    } else {
+        out("    call %s\n", n->name);
+    }
     if (argc) out("    add esp, %d\n", argc * 4);
 }
 
@@ -456,6 +480,10 @@ static int already_extern(const char *name) {
 
 #define MAX_STRINGS 256
 static node_t *g_strings[MAX_STRINGS];
+
+#define MAX_STATICS 64
+static node_t *g_statics[MAX_STATICS];
+static int g_n_statics;
 static int g_n_strings;
 
 /* Walks every reachable node (function bodies, global initializers - a/b/
@@ -478,6 +506,13 @@ static void walk_collect(node_t *n, node_t *prog) {
     if (n->kind == ND_STR && g_n_strings < MAX_STRINGS) {
         g_strings[g_n_strings++] = n;
     }
+    /* static locals live inside a function body's statement list, not
+     * prog's top-level chain - the .data/.bss emission below only scans
+     * top-level decls, so without this they'd be referenced (lea eax,
+     * [__static_N]) but never actually allocated storage. */
+    if (n->kind == ND_VAR_DECL && n->is_static_local && g_n_statics < MAX_STATICS) {
+        g_statics[g_n_statics++] = n;
+    }
     walk_collect(n->a, prog);
     walk_collect(n->b, prog);
     walk_collect(n->c, prog);
@@ -494,12 +529,24 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
     g_loop = NULL;
     g_n_externs = 0;
     g_n_strings = 0;
+    g_n_statics = 0;
 
     out("BITS 32\n");
 
     for (node_t *n = prog; n; n = n->next) {
+        /* walk_collect recurses into ->next (needed for sibling statement
+         * chains reached via ->list/->init) - passing a top-level node
+         * straight through would also walk the rest of the top-level
+         * chain, which this loop is already advancing over itself,
+         * causing every node after the first to be collected once per
+         * remaining prefix (quadratic duplication of externs/strings).
+         * Cut the top-level ->next link before recursing into this one
+         * node's own subtree, then restore it. */
+        node_t *saved_next = n->next;
+        n->next = NULL;
         if (n->kind != ND_FUNC_DEF) walk_collect(n, prog); /* globals: just for string literals in initializers */
         else walk_collect(n->b, prog);                       /* function bodies */
+        n->next = saved_next;
     }
     for (int i = 0; i < g_n_externs; i++) out("extern %s\n", g_externs[i]);
 
@@ -507,10 +554,31 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
     for (node_t *n = prog; n; n = n->next) {
         if (n->kind == ND_FUNC_DEF) codegen_func(n);
     }
-    if (target == TARGET_HOST) {
-        /* Still inside `section .text` - must stay there, not after the
-         * .rodata switch below. */
+    int has_main = 0;
+    for (node_t *n = prog; n; n = n->next) {
+        if (n->kind == ND_FUNC_DEF && strcmp(n->name, "main") == 0) { has_main = 1; break; }
+    }
+    if (target == TARGET_HOST && has_main) {
+        /* Only the one compilation unit that actually defines main should
+         * provide _start - host programs are typically built from several
+         * --target=host files (e.g. mkfs_tinyfs.c + tinyfs.c + string.c),
+         * and emitting a `call main` in every one of them would leave an
+         * unresolvable reference in every file that doesn't itself define
+         * main (there's no separate crt0.o in this toolchain - see
+         * docs/toolchain.md). Still inside `section .text` - must stay
+         * there, not after the .rodata switch below. */
         out("global _start\n_start:\n");
+        /* At kernel entry, [esp]=argc and [esp+4] is the start of the
+         * argv[] pointer array - i.e. "argv" (the char** value) is the
+         * address (esp+4), not a value stored on the stack. A plain
+         * `call main` would push a return address first, shifting argc
+         * into place by coincidence but leaving the second cdecl slot
+         * holding argv[0]'s string pointer instead of &argv[0]. Load
+         * both explicitly before the call. */
+        out("    mov eax, [esp]\n");
+        out("    lea ecx, [esp+4]\n");
+        out("    push ecx\n");
+        out("    push eax\n");
         out("    call main\n");
         out("    mov ebx, eax\n    mov eax, 1\n    int 0x80\n");
     }
@@ -529,15 +597,25 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
 
     int any_data = 0, any_bss = 0;
     for (node_t *n = prog; n; n = n->next) {
-        if (n->kind == ND_VAR_DECL && (n->is_global || n->is_static_local)) {
+        if (n->kind == ND_VAR_DECL && n->is_global) {
             if (n->init) any_data = 1; else any_bss = 1;
         }
+    }
+    for (int i = 0; i < g_n_statics; i++) {
+        if (g_statics[i]->init) any_data = 1; else any_bss = 1;
     }
 
     if (any_data) {
         out("section .data\n");
         for (node_t *n = prog; n; n = n->next) {
-            if (n->kind == ND_VAR_DECL && (n->is_global || n->is_static_local) && n->init) {
+            if (n->kind == ND_VAR_DECL && n->is_global && n->init) {
+                out("global %s\n%s:\n", n->asm_label, n->asm_label);
+                emit_data_bytes(n->init, n->type);
+            }
+        }
+        for (int i = 0; i < g_n_statics; i++) {
+            node_t *n = g_statics[i];
+            if (n->init) {
                 out("global %s\n%s:\n", n->asm_label, n->asm_label);
                 emit_data_bytes(n->init, n->type);
             }
@@ -546,7 +624,13 @@ void codegen_emit(node_t *prog, void *out_file, cc_target_t target) {
     if (any_bss) {
         out("section .bss\n");
         for (node_t *n = prog; n; n = n->next) {
-            if (n->kind == ND_VAR_DECL && (n->is_global || n->is_static_local) && !n->init) {
+            if (n->kind == ND_VAR_DECL && n->is_global && !n->init) {
+                out("global %s\n%s:\n    resb %d\n", n->asm_label, n->asm_label, type_size(n->type));
+            }
+        }
+        for (int i = 0; i < g_n_statics; i++) {
+            node_t *n = g_statics[i];
+            if (!n->init) {
                 out("global %s\n%s:\n    resb %d\n", n->asm_label, n->asm_label, type_size(n->type));
             }
         }

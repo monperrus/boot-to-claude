@@ -209,6 +209,7 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
     const char *m = st->mnemonic;
     operand_t *a = &st->ops[0];
     operand_t *b = &st->ops[1];
+    operand_t *c = &st->ops[2];
     int is_bin = ctx->have_org;
 
     /* --- pseudo-ops for data directives: one scalar value per stmt --- */
@@ -465,6 +466,18 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
         return e.len;
     }
 
+    if (strcmp(m, "imul") == 0 && st->nops == 3 && st->bits == 32 && a->kind == OPND_REG && is_reg32(a->reg) && c->kind == OPND_IMM) {
+        /* imul r32, r/m32, imm32 - always full-size, same "no imm8
+         * sign-extend optimization" convention as the group1 ALU ops
+         * above (see the .db/.pad branch's imm32 comment). */
+        e8(&e, 0x69);
+        encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
+        int64_t v = c->has_sym
+            ? resolve_abs(ctx, is_bin, c->sym, c->disp, st->section, st->offset, strict)
+            : c->disp;
+        e32(&e, (uint32_t)v);
+        return e.len;
+    }
     if (strcmp(m, "imul") == 0 && st->bits == 32 && a->kind == OPND_REG && is_reg32(a->reg)) {
         e8(&e, 0x0F); e8(&e, 0xAF);
         encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
@@ -584,6 +597,14 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
         return e.len;
     }
 
+    if (strcmp(m, "call") == 0 && a->kind == OPND_REG && is_reg32(a->reg)) {
+        /* call r/m32 (FF /2) - indirect call through a register, e.g. a
+         * function-pointer variable's loaded value (see cc.h's
+         * is_indirect_call / docs/toolchain.md). */
+        e8(&e, 0xFF);
+        e8(&e, (uint8_t)(0xC0 | (2 << 3) | regnum(a->reg)));
+        return e.len;
+    }
     if (strcmp(m, "call") == 0) {
         if (st->bits == 16) {
             e8(&e, 0xE8);

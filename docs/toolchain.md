@@ -290,10 +290,131 @@ the loop: `tools/run_tests.sh` (full OS boot + shell + both languages)
 and `tools/run_toolchain_tests.sh` (CC's own test battery) both stay
 green throughout, built entirely with gcc/nasm/ld/objcopy as before.
 
-## LD, OBJCOPY
+## LD (linker, Phase T5)
 
-Not yet built - Phases T5/T6. Everything so far links with GNU `ld` and
-extracts with GNU `objcopy` as an interim step.
+`toolchain/ld/` parses ELF32 relocatable objects (`elf_reader.c`, sections
+indexed directly by their raw ELF section-header index so symbol
+`st_shndx` / relocation `sh_info` map straight in), merges same-kind
+sections across all input files **in command-line order** (`main.c`'s
+`merge_sections`), resolves symbols into one flat global table, and
+applies the two relocation types this project's object code actually
+produces: `R_386_32` (`value = S+A`) and `R_386_PC32` (`value = S+A-P`) -
+x86 ELF uses REL not RELA, so the addend `A` is read back out of the
+bytes AS already baked in, not stored separately.
+
+File-order concatenation replaces a real linker script's section-pattern
+matching (`*(.text.entry) *(.text*)` etc.) - the one simplification this
+phase relies on, and it only works because the Makefile already puts
+`entry.o` first on the command line. `classify_section()` matches
+section names by **prefix** (`.text`, `.rodata`, `.data`, `.bss`), not
+exact string - needed because nasm names `entry.S`'s section
+`.text.entry`, not `.text`; an exact match silently dropped `_start`
+from the link (caught by testing against the current *nasm*-built
+objects, not just AS's own output).
+
+Two output modes, sharing the merge/resolve/relocate core above:
+
+- `link_flat` (`-T <script>`, script contents never read - its mere
+  presence is the mode switch): hardcodes `kernel/link.ld`'s exact
+  layout, base `0x10000`, `.text`/`.rodata`/`.data`/`.bss` 4-byte-aligned
+  in sequence, injects `_bss_start`/`_bss_end`. Produces an `ET_EXEC`
+  with real section headers for `objcopy -O binary` to extract.
+- `link_static_exec` (default): a minimal real Linux ET_EXEC for host
+  tools - base `0x08048000`, one RWX `PT_LOAD` segment covering the
+  whole file, `.bss` covered only by `p_memsz > p_filesz`, **no section
+  header table** (`e_shoff=0` - `execve()`'s loader never reads them).
+  Entry point is the linked `_start` symbol; errors if none is found
+  (only CC `--target=host` output ever defines one).
+
+Verified functionally, not by byte-diff (ELF metadata/padding legitimately
+differs from GNU ld's output): the full `tests/toolchain/*.c` battery
+linked by LD and run directly (matching Phase T4's expected exit codes);
+the kernel linked by LD from a mix of nasm- and AS-assembled objects,
+booted in QEMU to `SELFTEST PASS` and a working interactive shell
+(scripting language, bytecode compiler+VM, tinyfs - via
+`tools/qemu_type.py`); and `tools/mkfs_tinyfs` itself - `kernel/fs/tinyfs.c`,
+`kernel/string.c`, and `tools/mkfs_tinyfs.c` compiled by `CC
+--target=host`, assembled by AS, linked by LD in `link_static_exec` mode,
+then actually run to format a real disk image, which then boots and
+passes the full `tools/run_tests.sh` suite.
+
+That last check surfaced five real, previously-latent bugs - none of them
+in LD itself, but in CC/AS paths LD's static_exec mode was the first
+thing to actually exercise end-to-end:
+
+- **CC preprocessor**: `#include`'s per-depth path buffer
+  (`static char paths[MAX_INCLUDE_DEPTH][600]`) was reused by every
+  sibling include at the same nesting depth, and `token_t.file` stores
+  that pointer directly (no copy) - a later sibling `#include`
+  overwriting the buffer retroactively "changed" the filename recorded
+  on every earlier token from the previous sibling. Fixed by giving each
+  include its own permanently-allocated path. Also, macro-in-macro
+  expansion only substituted one level deep (`TINYFS_DATA_BLOCK` ->
+  `(TINYFS_INODE_BLOCK + ...)` left `TINYFS_INODE_BLOCK` unexpanded) -
+  replaced with a proper recursive expander guarded against
+  self-reference.
+- **CC codegen - `_start`**: emitted unconditionally in every
+  `--target=host` translation unit, so a multi-file host program
+  (`mkfs_tinyfs.c` + `tinyfs.c` + `string.c`) got a `call main` baked into
+  files that don't define `main`, which AS then couldn't resolve
+  (there's no separate crt0.o in this toolchain). Now only emitted by the
+  one unit that actually defines `main`. Relatedly, `_start` originally
+  did a bare `call main` - `call` itself pushes a return address, so
+  `argc` landed in the right cdecl slot by coincidence but `argv`
+  received `argv[0]`'s string-pointer value instead of `&argv[0]`; fixed
+  by loading argc/argv explicitly from `[esp]`/`[esp+4]` before the call.
+- **CC codegen - top-level string/extern collection**: `walk_collect`
+  recurses into `->next` (needed for statement sibling chains reached via
+  `->list`), but the top-level driver in `codegen_emit` *also* iterates
+  `n = n->next` while calling `walk_collect(n, prog)` on each node - so
+  each call re-walked the entire remaining top-level chain, duplicating
+  every string literal and extern once per remaining prefix.
+- **CC codegen - static locals never allocated**: the `.data`/`.bss`
+  emission loops only scanned `prog`'s top-level chain, but a `static`
+  local variable is declared inside a function body's statement list -
+  so `lea eax, [__static_N]` was emitted at every use site with no
+  matching `global __static_N` / storage anywhere, an unresolvable
+  symbol. Fixed by collecting static locals during the same recursive
+  walk used for strings/externs.
+- **CC codegen - function values didn't decay to a pointer**: a bare
+  function name used as a value (`tinyfs_init(disk_block_read, ...)`,
+  passing a callback) went through the same `ND_VAR` path as an ordinary
+  global - compute its address, then *dereference* it - which read the
+  function's own machine code bytes as if they were a stored pointer.
+  Fixed by skipping the dereference for `TY_FUNC`-typed values.
+- **CC codegen - no indirect calls**: calling *through* a function-pointer
+  variable (`block_read(...)` where `block_read` is a `static
+  tinyfs_block_read_fn`, assigned via `tinyfs_init`) always emitted a
+  direct `call block_read` - a jump straight into the `.bss` bytes
+  holding the pointer value, executed as instructions. The parser now
+  detects when a call's callee resolves to a variable rather than a
+  function symbol and marks the call indirect; codegen loads the stored
+  pointer and emits `call eax`. AS gained the corresponding `call r/m32`
+  (`FF /2`) encoding - previously only the direct relative form
+  (`E8 rel32`) existed.
+- **AS - 3-operand `imul` silently dropped its immediate**: the operand
+  parser had a hard 2-operand ceiling (`ops[2]`, no comma check after the
+  second operand), so `imul ecx, ecx, 4` (CC's array-indexing scale, e.g.
+  `argv[1]`) parsed as `ecx, ecx` with `, 4` silently discarded, then
+  encoded as the 2-operand register-multiply form (`ecx = ecx*ecx`
+  instead of `ecx*4`). This is a general, silent miscompilation of any
+  runtime-indexed array/pointer access with a non-constant-folded scale -
+  it went undetected by `tests/toolchain/t04_pointers.c` because that
+  test's array *writes* and *reads* both use the identical broken
+  formula (self-cancelling: `nums[i] = i*2` stores at `base+i*i`, and
+  `a[i]` in the summing loop reads back from `base+i*i` too), so the
+  final sum still came out right despite the underlying addresses being
+  wrong. It only surfaced when reading data written through a *different*
+  mechanism using real offsets - the kernel-provided `argv[]` array.
+  Fixed by extending `stmt_t.ops[]` to 3 slots and adding the proper
+  `imul r32, r/m32, imm32` encoding (`0x69 /r id`, always full imm32 -
+  same "no imm8 sign-extend optimization" convention the group1 ALU ops
+  already use).
+
+## OBJCOPY
+
+Not yet built - Phase T6. Everything so far extracts the flat kernel
+binary with GNU `objcopy -O binary` as an interim step.
 
 ## Bootstrap
 

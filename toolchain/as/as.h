@@ -75,7 +75,7 @@ typedef struct {
 
 typedef struct {
     char mnemonic[16];
-    operand_t ops[2];
+    operand_t ops[3]; /* only imul r32, r/m32, imm32 uses a 3rd operand */
     int nops;
     section_kind_t section;
     uint32_t offset;   /* byte offset within section where this statement's bytes start */
