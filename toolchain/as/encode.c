@@ -135,6 +135,73 @@ static int64_t resolve_pcrel(asm_ctx_t *ctx, int is_bin, const char *sym, int64_
     return addend;
 }
 
+/* --- generic 32-bit ModRM(+SIB+disp) encoder ---
+ * Used by CC-generated code (always 32-bit: kernel and host targets are
+ * both x86-32). Handles register-direct, [esp]/[esp+disp8] (SIB - ESP
+ * can't be a plain ModRM base), [ebp+disp32] (always the disp32 form,
+ * mod=10 - mod=00 with rm=101 means "disp32 direct address" instead of
+ * "ebp with no displacement", so EBP-relative never uses mod=00), and
+ * [label(+disp)] (mod=00, rm=101, disp32 direct address - 32-bit's other
+ * ModRM special case). `reg_field` is either another register or a group
+ * opcode extension number, per the caller. */
+static void encode_rm32(emitter_t *e, asm_ctx_t *ctx, int is_bin, operand_t *rm, int reg_field,
+                          section_kind_t patch_sec, uint32_t stmt_offset, int strict) {
+    if (rm->kind == OPND_REG) {
+        e8(e, (uint8_t)(0xC0 | (reg_field << 3) | regnum(rm->reg)));
+        return;
+    }
+    if (rm->reg == R_ESP) {
+        if (rm->disp == 0) {
+            e8(e, (uint8_t)(0x04 | (reg_field << 3)));
+            e8(e, 0x24);
+        } else {
+            e8(e, (uint8_t)(0x44 | (reg_field << 3)));
+            e8(e, 0x24);
+            e8(e, (uint8_t)rm->disp);
+        }
+        return;
+    }
+    if (rm->reg == R_EBP) {
+        e8(e, (uint8_t)(0x85 | (reg_field << 3)));
+        e32(e, (uint32_t)rm->disp);
+        return;
+    }
+    if (rm->reg != R_NONE) {
+        /* [reg] / [reg+disp] for any other GP register (EAX/ECX/EDX/EBX/
+         * ESI/EDI) - no SIB needed, and mod=00 with no displacement is
+         * safe here (rm=101/EBP is the only base register where mod=00
+         * means something else - see the EBP case above). Always uses
+         * the disp32 form when non-zero, same "no size-optimization"
+         * philosophy as everywhere else in this encoder. */
+        if (rm->disp == 0) {
+            e8(e, (uint8_t)(0x00 | (reg_field << 3) | regnum(rm->reg)));
+        } else {
+            e8(e, (uint8_t)(0x80 | (reg_field << 3) | regnum(rm->reg)));
+            e32(e, (uint32_t)rm->disp);
+        }
+        return;
+    }
+    /* bare label, no base register: 32-bit direct address */
+    e8(e, (uint8_t)(0x05 | (reg_field << 3)));
+    uint32_t patch_off = stmt_offset + (uint32_t)e->len;
+    int64_t addr = resolve_abs(ctx, is_bin, rm->sym, rm->disp, patch_sec, patch_off, strict);
+    e32(e, (uint32_t)addr);
+}
+
+/* ADD/OR/AND/SUB/XOR/CMP share one opcode block layout:
+ * base+0 = r/m8,r8 ; base+1 = r/m32,r32 ; base+2 = r8,r/m8 ; base+3 = r32,r/m32
+ * base+4 = AL,imm8 ; base+5 = eAX,imm32 ; group1 (0x81 /ext) = r/m,imm32 */
+static int alu_lookup(const char *m, int *base, int *ext) {
+    static const struct { const char *name; int base, ext; } table[] = {
+        { "add", 0x00, 0 }, { "or", 0x08, 1 }, { "and", 0x20, 4 },
+        { "sub", 0x28, 5 }, { "xor", 0x30, 6 }, { "cmp", 0x38, 7 },
+    };
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        if (strcmp(m, table[i].name) == 0) { *base = table[i].base; *ext = table[i].ext; return 1; }
+    }
+    return 0;
+}
+
 /* --- the encoder --- */
 
 int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
@@ -166,7 +233,34 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
         return e.len;
     }
 
-    /* --- real instructions --- */
+    /* --- generic 32-bit ALU ops (add/or/and/sub/xor/cmp): reg<->reg,
+     * reg<->mem(ebp/esp/label), reg<->imm32 - what CC's codegen emits.
+     * Gated on bits==32 so this can never shadow the 16-bit real-mode
+     * forms below (which have their own, narrower matches). */
+    {
+        int base, ext;
+        if (st->bits == 32 && alu_lookup(m, &base, &ext)) {
+            if (a->kind == OPND_REG && is_reg32(a->reg) && (b->kind == OPND_REG || b->kind == OPND_MEM)) {
+                e8(&e, (uint8_t)(base + 3)); /* r32, r/m32 */
+                encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
+                return e.len;
+            }
+            if ((a->kind == OPND_REG || a->kind == OPND_MEM) && b->kind == OPND_REG && is_reg32(b->reg)) {
+                e8(&e, (uint8_t)(base + 1)); /* r/m32, r32 */
+                encode_rm32(&e, ctx, is_bin, a, regnum(b->reg), st->section, st->offset, strict);
+                return e.len;
+            }
+            if ((a->kind == OPND_REG || a->kind == OPND_MEM) && b->kind == OPND_IMM) {
+                e8(&e, 0x81); /* r/m32, imm32 (always full-size - no imm8 sign-extend optimization) */
+                encode_rm32(&e, ctx, is_bin, a, ext, st->section, st->offset, strict);
+                int64_t v = b->has_sym
+                    ? resolve_abs(ctx, is_bin, b->sym, b->disp, st->section, st->offset + (uint32_t)e.len, strict)
+                    : b->disp;
+                e32(&e, (uint32_t)v);
+                return e.len;
+            }
+        }
+    }
 
     if (strcmp(m, "xor") == 0 || strcmp(m, "or") == 0 || strcmp(m, "sub") == 0 || strcmp(m, "add") == 0) {
         int ext = strcmp(m, "add") == 0 ? 0 : strcmp(m, "or") == 0 ? 1 : strcmp(m, "sub") == 0 ? 5 : 6; /* xor */
@@ -190,20 +284,20 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
             e8(&e, (uint8_t)b->disp);
             return e.len;
         }
-        if (a->kind == OPND_REG && a->reg == R_EAX && b->kind == OPND_IMM) {
+        if (a->kind == OPND_REG && a->reg == R_EAX && b->kind == OPND_IMM && st->bits == 16) {
             e8(&e, 0x66);
             e8(&e, (uint8_t)(0x05 + ext * 8));
             e32(&e, (uint32_t)b->disp);
             return e.len;
         }
-        if (a->kind == OPND_MEM && !a->reg && b->kind == OPND_REG && is_reg32(b->reg)) {
+        if (st->bits == 16 && a->kind == OPND_MEM && !a->reg && b->kind == OPND_REG && is_reg32(b->reg)) {
             e8(&e, 0x66);
             e8(&e, (uint8_t)(0x01 + ext * 8));
             e8(&e, (uint8_t)(0x06 | (regnum(b->reg) << 3)));
             e16(&e, (uint16_t)resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, st->offset + (uint32_t)e.len, strict));
             return e.len;
         }
-        if (a->kind == OPND_MEM && !a->reg && b->kind == OPND_REG && is_reg16(b->reg)) {
+        if (st->bits == 16 && a->kind == OPND_MEM && !a->reg && b->kind == OPND_REG && is_reg16(b->reg)) {
             e8(&e, (uint8_t)(0x01 + ext * 8));
             e8(&e, (uint8_t)(0x06 | (regnum(b->reg) << 3)));
             e16(&e, (uint16_t)resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, st->offset + (uint32_t)e.len, strict));
@@ -270,31 +364,31 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
             e8(&e, (uint8_t)(0xC0 | (regnum(a->reg) << 3) | regnum(b->reg)));
             return e.len;
         }
-        if (a->kind == OPND_REG && is_reg16(a->reg) && b->kind == OPND_MEM && !b->reg) {
+        if (st->bits == 16 && a->kind == OPND_REG && is_reg16(a->reg) && b->kind == OPND_MEM && !b->reg) {
             e8(&e, 0x8B);
             e8(&e, (uint8_t)(0x06 | (regnum(a->reg) << 3)));
             e16(&e, (uint16_t)resolve_abs(ctx, is_bin, b->sym, b->disp, st->section, st->offset + (uint32_t)e.len, strict));
             return e.len;
         }
-        if (a->kind == OPND_MEM && !a->reg && b->kind == OPND_REG && is_reg16(b->reg)) {
+        if (st->bits == 16 && a->kind == OPND_MEM && !a->reg && b->kind == OPND_REG && is_reg16(b->reg)) {
             e8(&e, 0x89);
             e8(&e, (uint8_t)(0x06 | (regnum(b->reg) << 3)));
             e16(&e, (uint16_t)resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, st->offset + (uint32_t)e.len, strict));
             return e.len;
         }
-        if (a->kind == OPND_REG && is_reg32(a->reg) && b->kind == OPND_MEM && !b->reg) {
+        if (st->bits == 16 && a->kind == OPND_REG && is_reg32(a->reg) && b->kind == OPND_MEM && !b->reg) {
             e8(&e, 0x66); e8(&e, 0x8B);
             e8(&e, (uint8_t)(0x06 | (regnum(a->reg) << 3)));
             e16(&e, (uint16_t)resolve_abs(ctx, is_bin, b->sym, b->disp, st->section, st->offset + (uint32_t)e.len, strict));
             return e.len;
         }
-        if (a->kind == OPND_MEM && !a->reg && b->kind == OPND_REG && is_reg32(b->reg)) {
+        if (st->bits == 16 && a->kind == OPND_MEM && !a->reg && b->kind == OPND_REG && is_reg32(b->reg)) {
             e8(&e, 0x66); e8(&e, 0x89);
             e8(&e, (uint8_t)(0x06 | (regnum(b->reg) << 3)));
             e16(&e, (uint16_t)resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, st->offset + (uint32_t)e.len, strict));
             return e.len;
         }
-        if (a->kind == OPND_MEM && !a->reg && b->kind == OPND_IMM && a->size_override == 2) {
+        if (st->bits == 16 && a->kind == OPND_MEM && !a->reg && b->kind == OPND_IMM && a->size_override == 2) {
             e8(&e, 0xC7);
             e8(&e, (uint8_t)0x06);
             e16(&e, (uint16_t)resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, st->offset + (uint32_t)e.len, strict));
@@ -302,7 +396,7 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
             e16(&e, (uint16_t)v);
             return e.len;
         }
-        if (a->kind == OPND_MEM && !a->reg && b->kind == OPND_IMM && a->size_override == 4) {
+        if (st->bits == 16 && a->kind == OPND_MEM && !a->reg && b->kind == OPND_IMM && a->size_override == 4) {
             e8(&e, 0x66); e8(&e, 0xC7);
             e8(&e, (uint8_t)0x06);
             e16(&e, (uint16_t)resolve_abs(ctx, is_bin, a->sym, a->disp, st->section, st->offset + (uint32_t)e.len, strict));
@@ -322,6 +416,90 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
             }
             return e.len;
         }
+
+        /* --- generic 32-bit forms: reg<->reg, reg<->mem(ebp/label),
+         * mem<->imm32, 8-bit reg<->mem(ebp/label) - what CC's codegen
+         * emits for locals/globals/struct fields. */
+        if (st->bits == 32) {
+            if (a->kind == OPND_REG && is_reg32(a->reg) && (b->kind == OPND_REG || b->kind == OPND_MEM)) {
+                e8(&e, 0x8B);
+                encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
+                return e.len;
+            }
+            if (a->kind == OPND_MEM && b->kind == OPND_REG && is_reg32(b->reg)) {
+                e8(&e, 0x89);
+                encode_rm32(&e, ctx, is_bin, a, regnum(b->reg), st->section, st->offset, strict);
+                return e.len;
+            }
+            if (a->kind == OPND_REG && is_reg8(a->reg) && (b->kind == OPND_REG || b->kind == OPND_MEM)) {
+                e8(&e, 0x8A);
+                encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
+                return e.len;
+            }
+            if (a->kind == OPND_MEM && b->kind == OPND_REG && is_reg8(b->reg)) {
+                e8(&e, 0x88);
+                encode_rm32(&e, ctx, is_bin, a, regnum(b->reg), st->section, st->offset, strict);
+                return e.len;
+            }
+            if (a->kind == OPND_MEM && b->kind == OPND_IMM && a->size_override != 1) {
+                e8(&e, 0xC7);
+                encode_rm32(&e, ctx, is_bin, a, 0, st->section, st->offset, strict);
+                int64_t v = b->has_sym
+                    ? resolve_abs(ctx, is_bin, b->sym, b->disp, st->section, st->offset + (uint32_t)e.len, strict)
+                    : b->disp;
+                e32(&e, (uint32_t)v);
+                return e.len;
+            }
+            if (a->kind == OPND_MEM && b->kind == OPND_IMM && a->size_override == 1) {
+                e8(&e, 0xC6);
+                encode_rm32(&e, ctx, is_bin, a, 0, st->section, st->offset, strict);
+                e8(&e, (uint8_t)b->disp);
+                return e.len;
+            }
+        }
+    }
+
+    if (strcmp(m, "lea") == 0 && st->bits == 32 && a->kind == OPND_REG && is_reg32(a->reg) && b->kind == OPND_MEM) {
+        e8(&e, 0x8D);
+        encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
+        return e.len;
+    }
+
+    if (strcmp(m, "imul") == 0 && st->bits == 32 && a->kind == OPND_REG && is_reg32(a->reg)) {
+        e8(&e, 0x0F); e8(&e, 0xAF);
+        encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
+        return e.len;
+    }
+    if (strcmp(m, "idiv") == 0 && (a->kind == OPND_REG || a->kind == OPND_MEM)) {
+        e8(&e, 0xF7);
+        encode_rm32(&e, ctx, is_bin, a, 7, st->section, st->offset, strict);
+        return e.len;
+    }
+    if (strcmp(m, "not") == 0 && (a->kind == OPND_REG || a->kind == OPND_MEM)) {
+        e8(&e, 0xF7);
+        encode_rm32(&e, ctx, is_bin, a, 2, st->section, st->offset, strict);
+        return e.len;
+    }
+    if (strcmp(m, "neg") == 0 && (a->kind == OPND_REG || a->kind == OPND_MEM)) {
+        e8(&e, 0xF7);
+        encode_rm32(&e, ctx, is_bin, a, 3, st->section, st->offset, strict);
+        return e.len;
+    }
+    if (strcmp(m, "cdq") == 0) { e8(&e, 0x99); return e.len; }
+
+    if (strncmp(m, "set", 3) == 0 && a->kind == OPND_REG && is_reg8(a->reg)) {
+        static const struct { const char *suf; uint8_t op; } cc[] = {
+            { "e", 0x94 }, { "ne", 0x95 }, { "l", 0x9C }, { "le", 0x9E }, { "g", 0x9F }, { "ge", 0x9D },
+        };
+        for (size_t i = 0; i < sizeof(cc) / sizeof(cc[0]); i++) {
+            char full[16];
+            snprintf(full, sizeof(full), "set%s", cc[i].suf);
+            if (strcmp(m, full) == 0) {
+                e8(&e, 0x0F); e8(&e, cc[i].op);
+                e8(&e, (uint8_t)(0xC0 | regnum(a->reg)));
+                return e.len;
+            }
+        }
     }
 
     if (strcmp(m, "movzx") == 0 && is_reg32(a->reg) && is_reg16(b->reg)) {
@@ -329,11 +507,30 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
         e8(&e, (uint8_t)(0xC0 | (regnum(a->reg) << 3) | regnum(b->reg)));
         return e.len;
     }
+    if (strcmp(m, "movzx") == 0 && st->bits == 32 && is_reg32(a->reg) &&
+        (b->kind == OPND_REG ? is_reg8(b->reg) : 1)) {
+        e8(&e, 0x0F); e8(&e, 0xB6);
+        encode_rm32(&e, ctx, is_bin, b, regnum(a->reg), st->section, st->offset, strict);
+        return e.len;
+    }
 
     if (strcmp(m, "shl") == 0 && is_reg16(a->reg) && b->kind == OPND_IMM) {
         e8(&e, 0xC1);
         e8(&e, (uint8_t)(0xE0 | regnum(a->reg)));
         e8(&e, (uint8_t)b->disp);
+        return e.len;
+    }
+    if ((strcmp(m, "shl") == 0 || strcmp(m, "shr") == 0) && st->bits == 32 && is_reg32(a->reg) && b->kind == OPND_IMM) {
+        int ext = strcmp(m, "shl") == 0 ? 4 : 5;
+        e8(&e, 0xC1);
+        e8(&e, (uint8_t)(0xC0 | (ext << 3) | regnum(a->reg)));
+        e8(&e, (uint8_t)b->disp);
+        return e.len;
+    }
+    if ((strcmp(m, "shl") == 0 || strcmp(m, "shr") == 0) && st->bits == 32 && is_reg32(a->reg) && b->reg == R_CL) {
+        int ext = strcmp(m, "shl") == 0 ? 4 : 5;
+        e8(&e, 0xD3);
+        e8(&e, (uint8_t)(0xC0 | (ext << 3) | regnum(a->reg)));
         return e.len;
     }
 
@@ -350,6 +547,15 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
                                           (int64_t)st->offset + 6, st->section, st->offset + 2, strict, 4);
             e32(&e, (uint32_t)rel);
         }
+        return e.len;
+    }
+    if (strcmp(m, "jne") == 0 || strcmp(m, "jl") == 0 || strcmp(m, "jle") == 0 || strcmp(m, "jg") == 0 || strcmp(m, "jge") == 0) {
+        uint8_t cc = strcmp(m, "jne") == 0 ? 0x85 : strcmp(m, "jl") == 0 ? 0x8C : strcmp(m, "jle") == 0 ? 0x8E
+                     : strcmp(m, "jg") == 0 ? 0x8F : 0x8D; /* jge */
+        e8(&e, 0x0F); e8(&e, cc);
+        int64_t rel = resolve_pcrel(ctx, is_bin, a->sym, a->disp, st->section,
+                                      (int64_t)st->offset + 6, st->section, st->offset + 2, strict, 4);
+        e32(&e, (uint32_t)rel);
         return e.len;
     }
 

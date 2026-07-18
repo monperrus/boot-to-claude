@@ -241,7 +241,7 @@ static int size_keyword(const char *w, int *size) {
 static operand_t parse_mem(pstate_t *ps, line_t *ln) {
     operand_t o = {0};
     o.kind = OPND_MEM;
-    /* [reg], [reg+disp], [sym], [sym+disp] */
+    /* [reg], [reg+disp], [reg-disp], [sym], [sym+disp] */
     token_t t = line_peek(ln);
     if (t.kind == TK_IDENT) {
         const regdef_t *r = reg_lookup(t.text);
@@ -251,10 +251,11 @@ static operand_t parse_mem(pstate_t *ps, line_t *ln) {
         value_t v = eval_expr(ps, ln);
         if (v.has_sym) { o.has_sym = 1; safe_strcpy(o.sym, v.sym, MAX_NAME); o.disp = v.val; }
         else { o.disp = v.val; }
-    } else if (line_peek(ln).kind == TK_PLUS) {
+    } else if (line_peek(ln).kind == TK_PLUS || line_peek(ln).kind == TK_MINUS) {
+        int neg = line_peek(ln).kind == TK_MINUS;
         line_next(ln);
         value_t v = eval_expr(ps, ln);
-        o.disp = v.val; /* our only reg+disp forms use plain constants */
+        o.disp = neg ? -v.val : v.val; /* our only reg+/-disp forms use plain constants */
     }
     if (line_peek(ln).kind == TK_RBRACK) line_next(ln); else perr(ps, "expected ]");
     return o;

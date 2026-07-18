@@ -35,48 +35,17 @@ int write_elf32(asm_ctx_t *ctx, const char *path) {
     for (int s = 0; s < MAX_SECTIONS; s++) reloc_for[s] = 0;
     for (int i = 0; i < ctx->nrelocs; i++) reloc_for[ctx->relocs[i].section] = 1;
 
-    /* --- symbol table: locals first (ELF requirement), then globals --- */
-    static Elf32_Sym symtab[MAX_SYMS + 1];
-    int nsym = 0;
-    static strtab_builder_t strtab;
-    memset(&strtab, 0, sizeof(strtab));
-    static int sym_elf_index[MAX_SYMS];
-
-    symtab[nsym++] = (Elf32_Sym){0}; /* index 0: null symbol */
-
-    for (int pass = 0; pass < 2; pass++) { /* pass 0 = locals, pass 1 = globals */
-        for (int i = 0; i < ctx->nsyms; i++) {
-            symbol_t *s = &ctx->syms[i];
-            if (s->is_equ) continue;
-            if (!s->defined && !s->is_extern) continue;
-            int is_glob = s->is_global || s->is_extern;
-            if ((pass == 0 && is_glob) || (pass == 1 && !is_glob)) continue;
-
-            Elf32_Sym sym = {0};
-            sym.st_name = strtab_add(&strtab, s->name);
-            sym.st_info = (unsigned char)ELF32_ST_INFO(is_glob ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE);
-            if (s->defined) {
-                sym.st_shndx = (Elf32_Half)(1 + s->section); /* +1: section 0 is the null section */
-                sym.st_value = s->offset;
-            } else {
-                sym.st_shndx = SHN_UNDEF;
-            }
-            sym_elf_index[i] = nsym;
-            symtab[nsym++] = sym;
-        }
-    }
-    int first_global = 1;
-    for (int i = 1; i < nsym; i++) {
-        if ((symtab[i].st_info >> 4) == STB_LOCAL) first_global = i + 1;
-    }
-
-    /* --- section header string table --- */
+    /* --- section header string table + index plan ---
+     * 0=NULL, 1..n_content=content, then one .rel.X per content section
+     * with relocs, then .symtab, .strtab, .shstrtab. Computed before the
+     * symbol table below, which needs shidx_content[] to translate our
+     * internal section_kind_t into the real ELF section header index -
+     * they're NOT the same number, since only sections actually used
+     * appear in the file (e.g. a .bss-only object has no .data, so .bss
+     * isn't at its "usual" index). */
     static strtab_builder_t shstrtab;
     memset(&shstrtab, 0, sizeof(shstrtab));
 
-    /* section index plan: 0=NULL, 1..n_content=content, then one
-     * .rel.X per content section with relocs, then .symtab, .strtab,
-     * .shstrtab */
     int shidx_content[MAX_SECTIONS];
     for (int i = 0; i < MAX_SECTIONS; i++) { shidx_content[i] = -1; }
 
@@ -102,6 +71,41 @@ int write_elf32(asm_ctx_t *ctx, const char *path) {
     uint32_t name_strtab = strtab_add(&shstrtab, ".strtab");
     int shidx_shstrtab = nsh++;
     uint32_t name_shstrtab = strtab_add(&shstrtab, ".shstrtab");
+
+    /* --- symbol table: locals first (ELF requirement), then globals --- */
+    static Elf32_Sym symtab[MAX_SYMS + 1];
+    int nsym = 0;
+    static strtab_builder_t strtab;
+    memset(&strtab, 0, sizeof(strtab));
+    static int sym_elf_index[MAX_SYMS];
+
+    symtab[nsym++] = (Elf32_Sym){0}; /* index 0: null symbol */
+
+    for (int pass = 0; pass < 2; pass++) { /* pass 0 = locals, pass 1 = globals */
+        for (int i = 0; i < ctx->nsyms; i++) {
+            symbol_t *s = &ctx->syms[i];
+            if (s->is_equ) continue;
+            if (!s->defined && !s->is_extern) continue;
+            int is_glob = s->is_global || s->is_extern;
+            if ((pass == 0 && is_glob) || (pass == 1 && !is_glob)) continue;
+
+            Elf32_Sym sym = {0};
+            sym.st_name = strtab_add(&strtab, s->name);
+            sym.st_info = (unsigned char)ELF32_ST_INFO(is_glob ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE);
+            if (s->defined) {
+                sym.st_shndx = (Elf32_Half)shidx_content[s->section];
+                sym.st_value = s->offset;
+            } else {
+                sym.st_shndx = SHN_UNDEF;
+            }
+            sym_elf_index[i] = nsym;
+            symtab[nsym++] = sym;
+        }
+    }
+    int first_global = 1;
+    for (int i = 1; i < nsym; i++) {
+        if ((symtab[i].st_info >> 4) == STB_LOCAL) first_global = i + 1;
+    }
 
     /* --- relocation table entries, grouped by target section --- */
     static Elf32_Rel rels[MAX_SECTIONS][MAX_RELOCS];
