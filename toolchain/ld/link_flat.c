@@ -102,12 +102,16 @@ int write_flat_elf(link_ctx_t *ctx, const char *path, uint32_t base) {
 
     static Elf32_Sym symtab[MAX_OUT_SYMS + 1];
     int nsym = 0;
-    symtab[nsym++] = (Elf32_Sym){0};
+    /* Not a compound literal (CC doesn't support them - see
+     * docs/toolchain.md, Phase T3/T8): symtab is `static`, but a prior
+     * call in the same process could have left index 0 non-zero. */
+    memset(&symtab[nsym], 0, sizeof(symtab[nsym]));
+    nsym++;
     for (int i = 0; i < ctx->n_out_syms; i++) {
         out_symbol_t *s = &ctx->out_syms[i];
         Elf32_Sym sym = {0};
         sym.st_name = strtab_add(&strtab, s->name);
-        sym.st_info = (unsigned char)ELF32_ST_INFO(STB_GLOBAL, STT_NOTYPE);
+        sym.st_info = (unsigned char)elf32_st_info(STB_GLOBAL, STT_NOTYPE);
         sym.st_value = s->addr;
         sym.st_shndx = 1; /* not meaningful for our purposes (address-based, not section-relative) once linked; any nonzero value marks it defined */
         symtab[nsym++] = sym;

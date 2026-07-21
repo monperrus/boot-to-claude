@@ -68,20 +68,25 @@ BUILD_SUBDIRS := $(BUILD) $(BUILD)/toolchain $(BUILD)/fs $(BUILD)/shell \
 $(BUILD_SUBDIRS):
 	mkdir -p $@
 
-# --- bootstrap: build our own AS/CC/LD from source, once, with the host's gcc ---
+# --- bootstrap: the full self-hosting chain (Phase T8) ---
+# tools/bootstrap_selfhost.sh does all three stages itself: Stage1 via
+# the host's real compiler (BOOTSTRAP_CC, used nowhere else - this is
+# its only invocation in the whole build), Stage2 by compiling
+# toolchain/{as,cc,ld}'s own source with Stage1, Stage3 by compiling it
+# again with Stage2 - and requires Stage2 and Stage3 to be byte-
+# identical before installing that verified result here. Every target
+# below this point (kernel, mkfs_tinyfs, the disk image) is therefore
+# built by a toolchain that has proven it can reproduce its own binary,
+# not just "compiled once by something else that tolerated its source".
 
 TOOLCHAIN_AS_SRCS := $(wildcard toolchain/as/*.c)
 TOOLCHAIN_CC_SRCS := $(wildcard toolchain/cc/*.c)
 TOOLCHAIN_LD_SRCS := $(wildcard toolchain/ld/*.c)
+TOOLCHAIN_HOSTLIB_SRCS := $(wildcard toolchain/hostlib/*.c)
 
-$(BUILD)/toolchain/as: $(TOOLCHAIN_AS_SRCS) | $(BUILD)/toolchain
-	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -o $@ $(TOOLCHAIN_AS_SRCS)
-
-$(BUILD)/toolchain/cc: $(TOOLCHAIN_CC_SRCS) | $(BUILD)/toolchain
-	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -o $@ $(TOOLCHAIN_CC_SRCS)
-
-$(BUILD)/toolchain/ld: $(TOOLCHAIN_LD_SRCS) | $(BUILD)/toolchain
-	$(BOOTSTRAP_CC) -Wall -Wextra -O2 -o $@ $(TOOLCHAIN_LD_SRCS)
+$(BUILD)/toolchain/as $(BUILD)/toolchain/cc $(BUILD)/toolchain/ld &: \
+		$(TOOLCHAIN_AS_SRCS) $(TOOLCHAIN_CC_SRCS) $(TOOLCHAIN_LD_SRCS) $(TOOLCHAIN_HOSTLIB_SRCS) | $(BUILD)/toolchain
+	BOOTSTRAP_CC=$(BOOTSTRAP_CC) tools/bootstrap_selfhost.sh $(BUILD)
 
 # --- boot loader (hand-written assembly, flat binary) ---
 

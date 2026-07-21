@@ -99,8 +99,8 @@ int read_object(const char *path, in_file_t *out) {
                 in_reloc_t *ir = &out->relocs[out->n_relocs++];
                 ir->section_idx = target_sec;
                 ir->offset = rel.r_offset;
-                ir->symbol_idx = (int)ELF32_R_SYM(rel.r_info);
-                ir->type = (int)ELF32_R_TYPE(rel.r_info);
+                ir->symbol_idx = (int)elf32_r_sym(rel.r_info);
+                ir->type = (int)elf32_r_type(rel.r_info);
             }
         }
     }

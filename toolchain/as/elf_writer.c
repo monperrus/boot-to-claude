@@ -79,7 +79,12 @@ int write_elf32(asm_ctx_t *ctx, const char *path) {
     memset(&strtab, 0, sizeof(strtab));
     static int sym_elf_index[MAX_SYMS];
 
-    symtab[nsym++] = (Elf32_Sym){0}; /* index 0: null symbol */
+    /* Not a compound literal (CC doesn't support them - see
+     * docs/toolchain.md, Phase T3/T8): symtab is `static`, but a prior
+     * call in the same process could have left index 0 non-zero, so
+     * this can't just rely on static zero-init either. */
+    memset(&symtab[nsym], 0, sizeof(symtab[nsym]));
+    nsym++; /* index 0: null symbol */
 
     for (int pass = 0; pass < 2; pass++) { /* pass 0 = locals, pass 1 = globals */
         for (int i = 0; i < ctx->nsyms; i++) {
@@ -91,7 +96,7 @@ int write_elf32(asm_ctx_t *ctx, const char *path) {
 
             Elf32_Sym sym = {0};
             sym.st_name = strtab_add(&strtab, s->name);
-            sym.st_info = (unsigned char)ELF32_ST_INFO(is_glob ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE);
+            sym.st_info = (unsigned char)elf32_st_info(is_glob ? STB_GLOBAL : STB_LOCAL, STT_NOTYPE);
             if (s->defined) {
                 sym.st_shndx = (Elf32_Half)shidx_content[s->section];
                 sym.st_value = s->offset;
@@ -118,7 +123,7 @@ int write_elf32(asm_ctx_t *ctx, const char *path) {
         int type = r->kind == RELOC_PC32 ? R_386_PC32 : R_386_32;
         int sec = r->section;
         rels[sec][nrels[sec]].r_offset = r->offset;
-        rels[sec][nrels[sec]].r_info = ELF32_R_INFO(symidx, type);
+        rels[sec][nrels[sec]].r_info = elf32_r_info(symidx, type);
         nrels[sec]++;
     }
 

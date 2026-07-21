@@ -221,7 +221,19 @@ int stmt_encode(asm_ctx_t *ctx, stmt_t *st, uint8_t *out, int strict) {
         if (width == 1) e8(&e, (uint8_t)v);
         else if (width == 2) e16(&e, (uint16_t)v);
         else if (width == 4) e32(&e, (uint32_t)v);
-        else { e32(&e, (uint32_t)v); e32(&e, (uint32_t)(v >> 32)); }
+        else {
+            /* `dq` (e.g. boot/boot.S's disk-address-packet LBA field):
+             * not `v >> 32` - under self-hosting (Phase T8), AS's own
+             * `int64_t` is CC's 32-bit alias (see toolchain/include/
+             * stdint.h), and x86's SHR/SAR masks a 32-bit shift count to
+             * 5 bits, so a *compiled* `v >> 32` silently becomes `v >> 0`
+             * (a no-op) instead of 0 - every `dq` in this codebase is a
+             * small non-negative constant (never real 64-bit data, see
+             * docs/toolchain.md), so the high word is always exactly a
+             * sign-extension of v, computed without any 32-bit shift. */
+            e32(&e, (uint32_t)v);
+            e32(&e, v < 0 ? 0xFFFFFFFFu : 0);
+        }
         return e.len;
     }
     if (strcmp(m, ".resb") == 0) {
@@ -734,7 +746,16 @@ int as_encode_pass2(asm_ctx_t *ctx) {
     for (int i = 0; i < ctx->nstmts; i++) {
         stmt_t *st = &ctx->stmts[i];
         section_kind_t sec = st->section;
-        uint8_t *dst = ctx->sec_bytes[sec] + st->offset;
+        /* .bss bytes are never actually read back (the ELF/flat writers
+         * both skip emitting them - a loader zeroes that address range
+         * at load time instead), only their *count* matters. Passing
+         * NULL here (the same "dry-run, length-only" mode pass 1 always
+         * uses - see e8) skips materializing them into sec_bytes at all,
+         * which matters once self-hosting is in the picture (Phase T8):
+         * AS's own `ctx` global alone reserves ~20MB of .bss, and
+         * sec_bytes[section] is a fixed 64KB buffer - writing real
+         * zero bytes for a reservation that large overflows it. */
+        uint8_t *dst = (sec == SEC_BSS) ? NULL : ctx->sec_bytes[sec] + st->offset;
         int len = stmt_encode(ctx, st, dst, 1);
         if ((uint32_t)len != st->length) {
             fprintf(stderr, "as: internal error: length mismatch for '%s' at line %d (pass1=%u pass2=%d)\n",

@@ -87,6 +87,11 @@ int write_static_exec_elf(link_ctx_t *ctx, const char *path) {
     /* .bss: no file content - covered by p_memsz > p_filesz, zero-filled by the loader */
 
     fclose(f);
-    chmod(path, 0755);
+    /* 0755 octal == 493 decimal - written in decimal since CC's lexer
+     * has no octal-literal support (see lexer.c's numeric-literal
+     * reader): a leading-zero literal like `0755` is silently read as
+     * plain decimal 755 (== octal 1363, a nonsense rwx pattern, mostly
+     * missing owner-read - see docs/toolchain.md, Phase T8). */
+    chmod(path, 493);
     return 0;
 }

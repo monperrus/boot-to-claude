@@ -108,7 +108,8 @@ static sym_t *add_local(parser_t *p, const char *name, type_t *type, int is_stat
         s->is_static_local = 1;
         snprintf(s->asm_label, MAX_NAME, "__static_%d", p->next_static_id++);
     } else {
-        p->frame_size += type_size(type) < 4 ? 4 : type_size(type); /* min 4-byte slots - simplicity over density */
+        int sz = type_size(type);
+        p->frame_size += sz < 4 ? 4 : sz; /* min 4-byte slots - simplicity over density */
         p->frame_size = (p->frame_size + 3) & ~3;
         s->frame_offset = -p->frame_size;
     }
@@ -126,6 +127,8 @@ static node_t *parse_unary(parser_t *p);
 static type_t *parse_type_name(parser_t *p); /* for casts/sizeof(type) */
 static node_t *parse_stmt(parser_t *p);
 static node_t *parse_block(parser_t *p);
+static node_t *make_binop(tok_kind_t op, node_t *a, node_t *b); /* for va_start/va_arg desugaring */
+static type_t *parse_array_dims(parser_t *p, type_t *base); /* for multi-dim array param decay */
 
 /* Array bounds and enum values in this codebase are often macro
  * constants that expand to a small arithmetic expression (e.g.
@@ -331,15 +334,18 @@ static member_t *parse_struct_members(parser_t *p) {
             while (match(p, TK_STAR)) mt = ptr_to(mt);
             token_t id = expect(p, TK_IDENT);
             safe_strcpy(name, id.text, MAX_NAME);
-            while (match(p, TK_LBRACKET)) {
-                int n = -1;
-                if (!check(p, TK_RBRACKET)) n = (int)parse_const_expr(p);
-                expect(p, TK_RBRACKET);
-                type_t *arr = type_new(TY_ARRAY);
-                arr->base = mt;
-                arr->array_len = n;
-                mt = arr;
-            }
+            /* Same bug as parse_declarator originally had (see
+             * parse_array_dims's own comment, Phase T8): wrapping `mt`
+             * in a new array type on *every* bracket group nests them
+             * in the wrong order for 2+ dimensions - `T x[8][65536]`
+             * needs the *first* bracket as the outermost dimension, not
+             * the last. as.h's own `uint8_t sec_bytes[MAX_SECTIONS]
+             * [65536]` is exactly this: the inverted nesting still adds
+             * up to the same *total* size (multiplication commutes),
+             * so it silently miscompiled only the *indexing* -
+             * `sec_bytes[SEC_DATA]` landed 8 bytes into the buffer
+             * instead of 65536, inside SEC_TEXT's own byte range. */
+            if (check(p, TK_LBRACKET)) mt = parse_array_dims(p, mt);
             member_t *m = calloc(1, sizeof(member_t));
             safe_strcpy(m->name, name, MAX_NAME);
             m->type = mt;
@@ -358,6 +364,14 @@ static type_t *parse_param_list(parser_t *p, char names[][MAX_NAME], int *n_name
     if (check(p, TK_RPAREN)) return NULL;
     if (is_kw(p, "void") && p->toks[p->pos + 1].kind == TK_RPAREN) { advance(p); return NULL; }
     for (;;) {
+        /* `...` (variadic tail, e.g. `fprintf`'s or codegen.c's own
+         * `out(const char *fmt, ...)`): stops named-parameter parsing
+         * here with no further storage of its own - call sites don't
+         * check argument counts against a prototype (each call arg is
+         * parsed/pushed independently, see codegen_call_or_builtin), so
+         * nothing downstream needs to know this function is variadic
+         * beyond "stop expecting more named params". */
+        if (check(p, TK_ELLIPSIS)) { advance(p); break; }
         type_t *base = parse_type_spec(p, NULL, NULL);
         type_t *pt = base;
         char nm[MAX_NAME] = {0};
@@ -381,10 +395,23 @@ static type_t *parse_param_list(parser_t *p, char names[][MAX_NAME], int *n_name
             pt = ptr_to(functy);
         } else {
             if (check(p, TK_IDENT)) { safe_strcpy(nm, cur(p).text, MAX_NAME); advance(p); }
-            while (match(p, TK_LBRACKET)) {
-                if (!check(p, TK_RBRACKET)) advance(p);
+            if (check(p, TK_LBRACKET)) {
+                /* Only the *outermost* dimension decays to a pointer -
+                 * `T x[][M]` as a parameter is `T (*x)[M]`, not `T**`.
+                 * (Real bug: parse_param_list's own declaration, right
+                 * here in this file, is `char names[][MAX_NAME]` - Phase
+                 * T8's self-hosting build is what first parsed this
+                 * function's signature through CC instead of gcc, and
+                 * the old always-ptr_to-every-bracket version silently
+                 * mis-typed its own `names` parameter as char**, making
+                 * every `names[n]` inside this same function index by
+                 * 4-byte pointer strides instead of MAX_NAME-byte array
+                 * strides - see docs/toolchain.md.) */
+                advance(p); /* consume the outer '[' */
+                if (!check(p, TK_RBRACKET)) advance(p); /* its size, if any - irrelevant for a param */
                 expect(p, TK_RBRACKET);
-                pt = ptr_to(pt); /* array param decays to pointer */
+                pt = parse_array_dims(p, pt); /* any further [N] groups stay real array dims */
+                pt = ptr_to(pt);
             }
         }
         type_t *node = type_new(pt->kind);
@@ -398,6 +425,31 @@ static type_t *parse_param_list(parser_t *p, char names[][MAX_NAME], int *n_name
     }
     if (n_names) *n_names = n;
     return head;
+}
+
+/* Parses zero or more trailing `[N]` groups (e.g. `rels[MAX_SECTIONS]
+ * [MAX_RELOCS]`, needed for Phase T8's self-hosting - see
+ * docs/toolchain.md) and nests them the way C actually does: the
+ * *first* bracket is the outermost array, so it must wrap a type built
+ * from the *later* brackets inward, not the other way around - collect
+ * the sizes first, then build from the last one back to the first. */
+static type_t *parse_array_dims(parser_t *p, type_t *base) {
+    int dims[8];
+    int ndims = 0;
+    while (match(p, TK_LBRACKET)) {
+        int n = -1;
+        if (!check(p, TK_RBRACKET)) n = (int)parse_const_expr(p);
+        expect(p, TK_RBRACKET);
+        dims[ndims++] = n;
+    }
+    type_t *t = base;
+    for (int i = ndims - 1; i >= 0; i--) {
+        type_t *arr = type_new(TY_ARRAY);
+        arr->base = t;
+        arr->array_len = dims[i];
+        t = arr;
+    }
+    return t;
 }
 
 /* Parses a declarator (the part after the base type specifier) and
@@ -427,15 +479,7 @@ static type_t *parse_declarator(parser_t *p, type_t *base, char *name_out,
     token_t id = expect(p, TK_IDENT);
     safe_strcpy(name_out, id.text, MAX_NAME);
 
-    if (match(p, TK_LBRACKET)) {
-        int n = -1;
-        if (!check(p, TK_RBRACKET)) n = (int)parse_const_expr(p);
-        expect(p, TK_RBRACKET);
-        type_t *arr = type_new(TY_ARRAY);
-        arr->base = base;
-        arr->array_len = n;
-        return arr;
-    }
+    if (check(p, TK_LBRACKET)) return parse_array_dims(p, base);
     if (match(p, TK_LPAREN)) {
         type_t *functy = type_new(TY_FUNC);
         functy->base = base;
@@ -449,15 +493,7 @@ static type_t *parse_declarator(parser_t *p, type_t *base, char *name_out,
 static type_t *parse_type_name(parser_t *p) {
     type_t *base = parse_type_spec(p, NULL, NULL);
     while (match(p, TK_STAR)) base = ptr_to(base);
-    if (match(p, TK_LBRACKET)) {
-        int n = -1;
-        if (!check(p, TK_RBRACKET)) n = (int)parse_const_expr(p);
-        expect(p, TK_RBRACKET);
-        type_t *arr = type_new(TY_ARRAY);
-        arr->base = base;
-        arr->array_len = n;
-        base = arr;
-    }
+    if (check(p, TK_LBRACKET)) base = parse_array_dims(p, base);
     return base;
 }
 
@@ -653,6 +689,71 @@ static node_t *parse_unary(parser_t *p) {
         node_t *operand = parse_unary(p);
         return make_num(type_size(operand->type));
     }
+    /* va_start/va_arg/va_end: not real functions (va_arg's second
+     * argument is a type, and CC's preprocessor has no function-like
+     * macros to hide any of this behind - see toolchain/include/stdarg.h),
+     * so these are parsed directly, like sizeof above. va_list is just
+     * `char *`; a cdecl frame's named params sit below the varargs in
+     * ascending address order, so:
+     *   va_start(ap, last) desugars to  ap = (char*)&last + K
+     *   va_arg(ap, T)       desugars to  *(T*)((ap += K) - K)
+     * (the compound-assign-then-subtract reads the *old* ap while still
+     * advancing it - the only way to get pre-increment-of-a-pointer
+     * semantics as a single expression without a temporary), where K is
+     * the (4-byte-rounded) size of the type being skipped/read. */
+    if (is_kw(p, "va_start")) {
+        advance(p);
+        expect(p, TK_LPAREN);
+        node_t *ap = parse_assign(p);
+        expect(p, TK_COMMA);
+        token_t id = expect(p, TK_IDENT);
+        node_t *last = resolve_ident(p, id.text, id);
+        expect(p, TK_RPAREN);
+        int k = (type_size(last->type) + 3) & ~3;
+        if (k < 4) k = 4;
+        node_t *addr = node_new(ND_ADDR);
+        addr->a = last;
+        addr->type = ptr_to(last->type);
+        node_t *cast = node_new(ND_CAST);
+        cast->a = addr;
+        cast->type = ptr_to(g_char_type);
+        node_t *sum = make_binop(TK_PLUS, cast, make_num(k));
+        node_t *assign = node_new(ND_ASSIGN);
+        assign->a = ap;
+        assign->b = sum;
+        assign->type = ap->type;
+        return assign;
+    }
+    if (is_kw(p, "va_arg")) {
+        advance(p);
+        expect(p, TK_LPAREN);
+        node_t *ap = parse_assign(p);
+        expect(p, TK_COMMA);
+        type_t *t = parse_type_name(p);
+        expect(p, TK_RPAREN);
+        int k = (type_size(t) + 3) & ~3;
+        if (k < 4) k = 4;
+        node_t *advance_ap = node_new(ND_COMPOUND_ASSIGN);
+        advance_ap->op = TK_PLUSEQ;
+        advance_ap->a = ap;
+        advance_ap->b = make_num(k);
+        advance_ap->type = ap->type;
+        node_t *old = make_binop(TK_MINUS, advance_ap, make_num(k));
+        node_t *cast = node_new(ND_CAST);
+        cast->a = old;
+        cast->type = ptr_to(t);
+        node_t *deref = node_new(ND_DEREF);
+        deref->a = cast;
+        deref->type = t;
+        return deref;
+    }
+    if (is_kw(p, "va_end")) {
+        advance(p);
+        expect(p, TK_LPAREN);
+        parse_assign(p); /* side-effect-free (a bare va_list variable) - discarded */
+        expect(p, TK_RPAREN);
+        return make_num(0);
+    }
     return parse_postfix(p);
 }
 
@@ -681,7 +782,16 @@ static node_t *make_binop(tok_kind_t op, node_t *a, node_t *b) {
     n->a = a;
     n->b = b;
     type_t *at = decay(a->type), *bt = decay(b->type);
-    if ((op == TK_PLUS || op == TK_MINUS) && is_ptr(at)) n->type = at;
+    /* `ptr - ptr` (e.g. toolchain/as/elf_writer.c's `s - ctx->syms`, an
+     * array-position computation - Phase T8's self-hosting build is
+     * what first exercised this) yields ptrdiff_t, an *integer* element
+     * count, not another pointer - must be checked before the general
+     * "either side is a pointer" cases below, which would otherwise
+     * mislabel it as pointer-typed and make codegen_binop's scaling
+     * logic multiply an address by the element size instead of dividing
+     * the byte difference by it (see docs/toolchain.md). */
+    if (op == TK_MINUS && is_ptr(at) && is_ptr(bt)) n->type = g_int_type;
+    else if ((op == TK_PLUS || op == TK_MINUS) && is_ptr(at)) n->type = at;
     else if (op == TK_PLUS && is_ptr(bt)) n->type = bt;
     else n->type = g_int_type;
     return n;
@@ -807,24 +917,37 @@ static node_t *parse_initializer(parser_t *p) {
 static node_t *parse_one_local_decl(parser_t *p, type_t *base, int is_static) {
     char name[MAX_NAME];
     type_t *t = parse_declarator(p, base, name, NULL, NULL);
-    sym_t *s = add_local(p, name, t, is_static);
     node_t *n = node_new(ND_VAR_DECL);
     safe_strcpy(n->name, name, MAX_NAME);
     n->type = t;
     n->is_static_local = is_static;
-    safe_strcpy(n->asm_label, s->asm_label, MAX_NAME);
-    n->frame_offset = s->frame_offset;
     if (match(p, TK_ASSIGN)) n->init = parse_initializer(p);
     /* Same `T name[] = { ... }` size-inference fix as parse_global_var -
      * needed here too for e.g. a function-local `static const T ops[] =
      * {...};` (used throughout the kernel's scripting-language parser
      * files) - see that function's comment for why array_len otherwise
-     * silently means sizeof(name) == 0. */
+     * silently means sizeof(name) == 0.
+     *
+     * Must run *before* add_local() below, not after (a real, previously-
+     * latent bug this exact ordering caused: add_local() sizes the stack
+     * slot via type_size(t), which for an unsized TY_ARRAY with
+     * array_len still -1 comes back as 0, rounded up to the "minimum
+     * 4-byte slot" fallback - so a genuinely 60-byte local array like
+     * is_type_start's own `const char *kws[] = {...}` (Phase T8's
+     * self-hosting build is what first compiled this function through
+     * CC instead of gcc) got only 4 bytes reserved, and initializing
+     * kws[1..14] then wrote straight through the saved ebp, the return
+     * address, and the caller's own stack args - see docs/toolchain.md).
+     * Inferring the size first means add_local always sees the real,
+     * final array_len. */
     if (t->kind == TY_ARRAY && t->array_len < 0 && n->init && n->init->kind == ND_BLOCK) {
         int count = 0;
         for (node_t *v = n->init->list; v; v = v->next) count++;
         t->array_len = count;
     }
+    sym_t *s = add_local(p, name, t, is_static);
+    safe_strcpy(n->asm_label, s->asm_label, MAX_NAME);
+    n->frame_offset = s->frame_offset;
     return n;
 }
 

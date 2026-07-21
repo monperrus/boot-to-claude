@@ -138,6 +138,17 @@ static void codegen_addr(node_t *n) {
         case ND_DEREF:
             codegen_expr(n->a);
             return;
+        case ND_CALL:
+            /* A struct/union-returning call used directly as an lvalue
+             * (e.g. as/parser.c's `line_peek(ln).kind` - a very common
+             * idiom, needed for Phase T8's self-hosting - see
+             * docs/toolchain.md). codegen_call_or_builtin already leaves
+             * the hidden result slot's address in eax for exactly this
+             * case (see its own comment) - the "address of a struct-
+             * typed rvalue" convention load_value/codegen_expr already
+             * use everywhere else, so this is just an ordinary call. */
+            codegen_expr(n);
+            return;
         default:
             fprintf(stderr, "cc: internal error: not an lvalue (kind %d)\n", n->kind);
             exit(1);
@@ -148,10 +159,25 @@ static void codegen_addr(node_t *n) {
 
 static void codegen_binop(node_t *n) {
     int a_is_ptr = n->a->type->kind == TY_PTR || n->a->type->kind == TY_ARRAY;
+    int b_is_ptr = n->b->type->kind == TY_PTR || n->b->type->kind == TY_ARRAY;
     codegen_expr(n->b);
     out("    push eax\n");
     codegen_expr(n->a);
     out("    pop ecx\n");
+    /* ptr - ptr (e.g. elf_writer.c's `s - ctx->syms`, an array-position
+     * computation): the *byte* difference divided by the element size,
+     * per make_binop's comment - eax=a, ecx=b already (see the
+     * evaluation order above). Must come before the general pointer-
+     * arithmetic scaling below: n->type is plain int here (make_binop
+     * never labels this result as a pointer), so that code wouldn't
+     * fire anyway, but this makes the actual division explicit rather
+     * than silently falling through to a plain integer subtraction. */
+    if (n->op == TK_MINUS && a_is_ptr && b_is_ptr) {
+        int sz = type_size(n->a->type->base);
+        out("    sub eax, ecx\n");
+        if (sz > 1) out("    cdq\n    mov ecx, %d\n    idiv ecx\n", sz);
+        return;
+    }
     /* Pointer arithmetic: scale whichever side is the integer operand.
      * eax=a, ecx=b at this point (per the evaluation order above). */
     if ((n->op == TK_PLUS || n->op == TK_MINUS) && (n->type->kind == TY_PTR || n->type->kind == TY_ARRAY)) {
@@ -570,6 +596,14 @@ static void codegen_stmt(node_t *n) {
 static void emit_data_bytes(node_t *init, type_t *t);
 
 static void emit_scalar_bytes(node_t *v, type_t *t) {
+    /* A string-literal initializer for a pointer-typed field (e.g.
+     * toolchain/as/parser.c's `static const regdef_t REGS[] =
+     * {{"al",R_AL,1}, ...}` - Phase T8's self-hosting build is what
+     * first exercised a string literal inside a struct-array global
+     * initializer) needs the string's own label, not v->num - an ND_STR
+     * node never sets ->num at all, so this silently emitted `dd 0`
+     * (a NULL pointer) instead of a relocation to the string's bytes. */
+    if (v->kind == ND_STR) { out("    dd %s\n", v->asm_label); return; }
     if (t->kind == TY_CHAR) out("    db %lld\n", (long long)v->num);
     else out("    dd %lld\n", (long long)v->num);
 }
@@ -577,6 +611,21 @@ static void emit_scalar_bytes(node_t *v, type_t *t) {
 static void emit_data_bytes(node_t *init, type_t *t) {
     if (!init) {
         out("    resb %d\n", type_size(t));
+        return;
+    }
+    /* `char x[N] = "literal"` (no braces - distinct from `char x[] =
+     * {'a','b',0}`): real C semantics copy the string's own bytes
+     * (including its NUL) into x's storage, zero-padding any remaining
+     * space - not store a pointer, which is what falling through to
+     * emit_scalar_bytes's ND_STR case (a few lines down, meant for
+     * pointer-typed fields like a struct's `const char *name`) would do
+     * instead. First hit by AS's own `char default_label[MAX_NAME] =
+     * "";` (Phase T8's self-hosting build). */
+    if (t->kind == TY_ARRAY && init->kind == ND_STR) {
+        int n = (int)strlen(init->str) + 1;
+        for (int i = 0; i < n; i++) out("    db %d\n", (unsigned char)init->str[i]);
+        int pad = type_size(t) - n;
+        if (pad > 0) out("    resb %d\n", pad);
         return;
     }
     if (t->kind == TY_ARRAY && init->kind == ND_BLOCK) {
@@ -615,7 +664,59 @@ static void emit_data_bytes(node_t *init, type_t *t) {
  * ebp-offset; a plain scalar just evaluates and stores at that offset,
  * which also serves as the non-aggregate base case (a bare `int x = 1;`
  * behaves like a one-element "aggregate" of itself). */
+static void codegen_zero_range(int base_offset, int size) {
+    char ltop[MAX_NAME], lend[MAX_NAME];
+    new_label(ltop); new_label(lend);
+    out("    push ecx\n");
+    out("    mov ecx, 0\n");
+    out("%s:\n", ltop);
+    out("    cmp ecx, %d\n", size);
+    out("    jge %s\n", lend);
+    out("    lea eax, [ebp%+d]\n", base_offset);
+    out("    add eax, ecx\n");
+    out("    mov byte [eax], 0\n");
+    out("    add ecx, 1\n");
+    out("    jmp %s\n", ltop);
+    out("%s:\n", lend);
+    out("    pop ecx\n");
+}
+
 static void codegen_init_local(int base_offset, type_t *t, node_t *init) {
+    /* A short brace-init list (fewer values than the aggregate has
+     * elements/members - e.g. `line_t ln = {0};` for a struct with three
+     * members, one of them a whole array) leaves every uncovered byte at
+     * whatever garbage was already on the stack, not zero - the same gap
+     * emit_data_bytes already closes for *global* aggregates via a
+     * trailing `resb`, but nothing did for a local one until now (see
+     * docs/toolchain.md, Phase T8: this exact gap, on this exact
+     * pattern, sent as/parser.c's own line-tokenizing loop into an
+     * infinite loop reading uninitialized bounds/EOF-check fields). Zero
+     * the whole range up front (redundant on nested recursive calls, but
+     * harmless and simplest) so every element/member not explicitly
+     * listed below is correctly zero rather than garbage. */
+    if ((t->kind == TY_ARRAY || t->kind == TY_STRUCT || t->kind == TY_UNION) && init->kind == ND_BLOCK) {
+        codegen_zero_range(base_offset, type_size(t));
+    }
+    /* `char x[N] = "literal"` (no braces): same real-C-semantics gap as
+     * emit_data_bytes's own ND_STR branch (see its comment) - falling
+     * through to the plain-scalar case below would treat this as a
+     * pointer store (the string's *address*, via codegen_expr's ND_STR
+     * case) instead of copying the string's bytes into x's own stack
+     * storage. First hit by codegen.c's own `char default_label[MAX_NAME]
+     * = "";` inside its ND_SWITCH case (Phase T8's self-hosting build):
+     * only the first 4 bytes of default_label ever got written (with an
+     * unrelated pointer value, not zero), so `default_label[0]` read as
+     * non-zero garbage and `jmp %s` emitted a jump to a garbage label
+     * name instead of ever falling back to `lend`. */
+    if (t->kind == TY_ARRAY && init->kind == ND_STR) {
+        codegen_zero_range(base_offset, type_size(t));
+        int n = (int)strlen(init->str) + 1;
+        for (int i = 0; i < n; i++) {
+            out("    lea eax, [ebp%+d]\n", base_offset + i);
+            out("    mov byte [eax], %d\n", (unsigned char)init->str[i]);
+        }
+        return;
+    }
     if (t->kind == TY_ARRAY && init->kind == ND_BLOCK) {
         int off = 0;
         for (node_t *v = init->list; v; v = v->next) {

@@ -39,6 +39,19 @@ static token_t mk(lexer_t *lx, tok_kind_t k) {
     return t;
 }
 
+/* Not a function-like macro (CC's preprocessor only supports object-like
+ * #define - see docs/toolchain.md, Phase T2): a plain helper covering
+ * every fixed two-character operator below. */
+static int try_two(lexer_t *lx, int c, int was_bol, int c1, int c2, tok_kind_t kind, token_t *out) {
+    if (c == c1 && peekc2(lx) == c2) {
+        lx->pos += 2;
+        *out = mk(lx, kind);
+        out->bol = was_bol;
+        return 1;
+    }
+    return 0;
+}
+
 static int read_escape(lexer_t *lx) {
     int c = advc(lx);
     switch (c) {
@@ -138,13 +151,26 @@ token_t lexer_next(lexer_t *lx) {
         return t;
     }
 
-#define TWO(c1, c2, kind) if (c == (c1) && peekc2(lx) == (c2)) { lx->pos += 2; token_t t = mk(lx, kind); t.bol = was_bol; return t; }
-    TWO('=', '=', TK_EQ) TWO('!', '=', TK_NEQ) TWO('<', '=', TK_LE) TWO('>', '=', TK_GE)
-    TWO('&', '&', TK_AND) TWO('|', '|', TK_OR) TWO('+', '+', TK_INC) TWO('-', '-', TK_DEC)
-    TWO('-', '>', TK_ARROW) TWO('+', '=', TK_PLUSEQ) TWO('-', '=', TK_MINUSEQ)
-    TWO('*', '=', TK_STAREQ) TWO('/', '=', TK_SLASHEQ) TWO('%', '=', TK_PERCENTEQ)
-    TWO('&', '=', TK_ANDEQ) TWO('|', '=', TK_OREQ) TWO('^', '=', TK_XOREQ)
-#undef TWO
+    {
+        token_t t;
+        if (try_two(lx, c, was_bol, '=', '=', TK_EQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '!', '=', TK_NEQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '<', '=', TK_LE, &t)) return t;
+        if (try_two(lx, c, was_bol, '>', '=', TK_GE, &t)) return t;
+        if (try_two(lx, c, was_bol, '&', '&', TK_AND, &t)) return t;
+        if (try_two(lx, c, was_bol, '|', '|', TK_OR, &t)) return t;
+        if (try_two(lx, c, was_bol, '+', '+', TK_INC, &t)) return t;
+        if (try_two(lx, c, was_bol, '-', '-', TK_DEC, &t)) return t;
+        if (try_two(lx, c, was_bol, '-', '>', TK_ARROW, &t)) return t;
+        if (try_two(lx, c, was_bol, '+', '=', TK_PLUSEQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '-', '=', TK_MINUSEQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '*', '=', TK_STAREQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '/', '=', TK_SLASHEQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '%', '=', TK_PERCENTEQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '&', '=', TK_ANDEQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '|', '=', TK_OREQ, &t)) return t;
+        if (try_two(lx, c, was_bol, '^', '=', TK_XOREQ, &t)) return t;
+    }
     if (c == '<' && peekc2(lx) == '<') {
         if (lx->pos + 2 < lx->len && lx->src[lx->pos + 2] == '=') { lx->pos += 3; token_t t = mk(lx, TK_SHLEQ); t.bol = was_bol; return t; }
         lx->pos += 2; token_t t = mk(lx, TK_SHL); t.bol = was_bol; return t;
@@ -152,6 +178,9 @@ token_t lexer_next(lexer_t *lx) {
     if (c == '>' && peekc2(lx) == '>') {
         if (lx->pos + 2 < lx->len && lx->src[lx->pos + 2] == '=') { lx->pos += 3; token_t t = mk(lx, TK_SHREQ); t.bol = was_bol; return t; }
         lx->pos += 2; token_t t = mk(lx, TK_SHR); t.bol = was_bol; return t;
+    }
+    if (c == '.' && peekc2(lx) == '.' && lx->pos + 2 < lx->len && lx->src[lx->pos + 2] == '.') {
+        lx->pos += 3; token_t t = mk(lx, TK_ELLIPSIS); t.bol = was_bol; return t;
     }
 
     lx->pos++;

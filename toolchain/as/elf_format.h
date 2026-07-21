@@ -99,13 +99,16 @@ typedef struct {
 #define STT_NOTYPE 0
 #define STT_FUNC 2
 #define STT_SECTION 3
-#define ELF32_ST_INFO(bind, type) (((bind) << 4) + ((type) & 0xf))
+/* Plain functions, not function-like macros: CC's preprocessor only
+ * supports object-like #define (see docs/toolchain.md, Phase T2) - these
+ * four need real parameters. */
+static inline unsigned char elf32_st_info(int bind, int type) { return (unsigned char)((bind << 4) + (type & 0xf)); }
 
 #define R_386_32 1
 #define R_386_PC32 2
-#define ELF32_R_SYM(info) ((info) >> 8)
-#define ELF32_R_TYPE(info) ((unsigned char)(info))
-#define ELF32_R_INFO(sym, type) (((sym) << 8) + (unsigned char)(type))
+static inline unsigned int elf32_r_sym(unsigned int info) { return info >> 8; }
+static inline unsigned char elf32_r_type(unsigned int info) { return (unsigned char)info; }
+static inline unsigned int elf32_r_info(unsigned int sym, unsigned int type) { return (sym << 8) + (unsigned char)type; }
 
 #define PT_LOAD 1
 #define PF_X 1

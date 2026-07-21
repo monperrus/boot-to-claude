@@ -27,8 +27,13 @@ static inline void safe_strcpy(char *dst, const char *src, size_t dstsize) {
 
 #define MAX_INPUT_FILES 32
 #define MAX_SECTIONS_PER_FILE 16
-#define MAX_SYMS_PER_FILE 512
-#define MAX_RELOCS_PER_FILE 512
+/* Generous - Phase T8's self-hosting build links object files with
+ * hundreds of symbols each (toolchain/as/encode.c's own object alone
+ * has 800+, mostly its many small static encoding-table entries and
+ * helper functions - see docs/toolchain.md), well past what any
+ * hand-written kernel/boot source file ever needed. */
+#define MAX_SYMS_PER_FILE 4096
+#define MAX_RELOCS_PER_FILE 4096
 #define MAX_NAME 128
 
 typedef enum { SEC_TEXT, SEC_RODATA, SEC_DATA, SEC_BSS, SEC_KIND_COUNT, SEC_KIND_OTHER } sec_kind_t;
@@ -79,7 +84,7 @@ typedef struct {
     int defined;
 } out_symbol_t;
 
-#define MAX_OUT_SYMS 2048
+#define MAX_OUT_SYMS 16384
 
 typedef struct {
     in_file_t files[MAX_INPUT_FILES];

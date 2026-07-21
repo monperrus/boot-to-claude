@@ -596,7 +596,193 @@ against real, previously-untested code, not by inspection:
   of keystroke timing - which ruled out a timing race and pointed at the
   character itself.
 
-## Bootstrap
+## Bootstrap (Phase T8 - self-hosting)
 
-_To be filled in once Phase T8 lands: the Stage0/1/2/3 procedure and how
-to re-verify Stage2 == Stage3._
+`tools/bootstrap_selfhost.sh` is the whole procedure, and it's what the
+Makefile's `$(BUILD)/toolchain/{as,cc,ld}` rule actually runs:
+
+1. **Stage1**: the host's real compiler (`BOOTSTRAP_CC`, `gcc` by
+   default - its only invocation anywhere in the build) compiles
+   `toolchain/{as,cc,ld}`'s source directly, the same one-shot build
+   Phase T7 already did.
+2. **Stage2**: Stage1's own `cc`/`as`/`ld` compile that *exact same
+   source* - including `toolchain/hostlib/`, see below - into a second
+   set of binaries.
+3. **Stage3**: Stage2 compiles the same source a third time.
+4. **Verify**: Stage2 and Stage3 must be byte-identical (`cmp`) for all
+   three tools. This is the standard GCC/LLVM fixed-point proof that a
+   compiler genuinely compiles itself, not just "happened to survive
+   being compiled once by something that tolerated its source."
+
+On success, Stage2 (== Stage3) is installed at `$(BUILD)/toolchain/
+{as,cc,ld}` - the exact path `AS`/`CC`/`LD` already pointed at since
+Phase T7 - so every kernel, boot-loader, and host-tool build after this
+one is genuinely self-hosted, not merely bootstrapped by an external
+compiler once and then reused.
+
+### hostlib: a minimal libc for AS/CC/LD's own source
+
+Phase T7's builtins (`__sys_open`/`read`/`write`/`lseek`/`close`/`exit`)
+were enough for `mkfs_tinyfs`, which was already deliberately written
+libc-free. `toolchain/{as,cc,ld}`'s own source was never written that
+way - it uses ordinary `fopen`/`fprintf`/`malloc`/`strcmp`/`isdigit`
+freely, same as any normal C program compiled by a normal compiler. Two
+new builtins (`__sys_brk`, `__sys_chmod`) plus `toolchain/hostlib/`
+(compiled into every `--target=host` binary alongside the program's own
+object files) implement just enough of `stdio.h`/`stdlib.h`/`string.h`/
+`ctype.h`/`sys/stat.h` to cover what that source actually calls:
+unbuffered `FILE*` I/O over the raw syscalls, a bump allocator over
+`brk(2)` (no `free()` - these are short-lived, single-pass build tools,
+same spirit as the rest of this codegen's "simple over optimal"
+philosophy), and a `printf`-format subset (`%s %d %u %c`, the `+` flag,
+`l`/`ll` length modifiers parsed and ignored - seen below, that's not a
+shortcut, it's the only self-consistent choice once `int64_t` is a
+32-bit alias).
+
+### New CC features, needed only because CC now compiles *itself*
+
+Two real language features, both invisible to every kernel/host-tool
+build target until AS/CC/LD's own source went through CC for the first
+time:
+
+- **Variadic functions** (`fprintf(FILE*, const char*, ...)`, and
+  codegen.c's own `out(const char *fmt, ...)`): `...` in a parameter
+  list is now accepted (parser.c's `parse_param_list`) with no further
+  bookkeeping needed - call sites already push each argument
+  independently with no prototype-arity check (see
+  `codegen_call_or_builtin`), so a variadic call "just works" once
+  parsing tolerates the extra parameter marker. `va_start`/`va_arg`/
+  `va_end` aren't real functions (CC's preprocessor has no function-like
+  macros, and `va_arg`'s second argument is a type name, which no
+  ordinary call could accept) - they're parsed directly, like `sizeof`,
+  and desugar into ordinary pointer arithmetic on a `char*` (`va_list`):
+  `va_start(ap, last)` becomes `ap = (char*)&last + K`; `va_arg(ap, T)`
+  becomes `*(T*)((ap += K) - K)` (the compound-assign-then-subtract is
+  the only way to get "read the old value, then advance" as one
+  expression without a temporary), where `K` is `last`'s (or `T`'s)
+  4-byte-rounded size.
+- **Multi-dimensional arrays** (`uint8_t sec_bytes[MAX_SECTIONS]
+  [65536]` in AS's own `as.h`): `parse_declarator`, `parse_type_name`,
+  and `parse_struct_members` all only handled one `[N]` group before,
+  silently either erroring or (worse, see below) nesting extra
+  dimensions in the wrong order. A shared `parse_array_dims` helper now
+  collects every `[N]` group and nests them correctly - the *first*
+  bracket is the outermost dimension, so it has to wrap a type built
+  from the trailing brackets inward, not the other way around.
+
+### Real bugs found
+
+This phase's verification bar was explicitly two-tier: the toolchain
+test battery (`tools/run_toolchain_tests.sh`, host-only, fast) had to
+pass under full self-hosting, *and* the full OS boot/shell suite
+(`tools/run_tests.sh`) had to keep passing against a disk image built
+entirely by the self-hosted result. Both were needed - one bug below
+was invisible to the first and only caught by the second. As with every
+previous phase, each was found by something concrete actually failing
+(a crash, a wrong exit code, a corrupted disk image), not by inspection:
+
+- **`elf_format.h`'s `ELF32_ST_INFO`/`ELF32_R_SYM`/`ELF32_R_TYPE`/
+  `ELF32_R_INFO` were function-like macros**: CC's preprocessor only
+  ever supported object-like `#define` (a Phase T2 scoping decision,
+  never previously an issue since no *kernel* source used one) - the
+  first time AS's or LD's own `elf_format.h` went through CC, these
+  four failed to expand as calls at all. Converted to plain `static
+  inline` functions (already proven to parse fine elsewhere, e.g.
+  `cc.h`'s own `safe_strcpy`).
+- **Three compound literals in AS's own source** (`(token_t){ .kind =
+  TK_EOF }` in `parser.c`, `(Elf32_Sym){0}` twice in `elf_writer.c`/
+  `link_flat.c`): compound literals were already known-unsupported
+  (Phase T3's compound-literal refactor covered `kernel/` and `tools/`,
+  but not `toolchain/` itself, since nothing had compiled `toolchain/`
+  through CC before). Replaced with `memset` + explicit field
+  assignment, the same pattern T3 established.
+- **`parse_param_list`'s own array-parameter decay was wrong for 2+
+  dimensions** - and its own declaration, right there in `parser.c`, is
+  `char names[][MAX_NAME]`: the old code wrapped every `[N]` bracket
+  group in another `ptr_to()`, so `T x[][M]` decayed to `T**` instead of
+  the correct `T (*x)[M]` (only the *first*, unsized dimension decays to
+  a pointer - trailing dimensions stay real array dimensions of the
+  pointee). Every `names[n]` inside `parse_param_list` itself then
+  indexed by 4-byte pointer strides instead of `MAX_NAME`-byte array
+  strides, corrupting parser state on the very first call with a real
+  parameter - self-hosting is what first parsed this function's own
+  signature through CC instead of gcc.
+- **`codegen_addr` had no case for a struct/union-returning `ND_CALL`**:
+  `line_peek(ln).kind` (member access directly on a struct-by-value
+  call's result, no intermediate variable) is a common, ordinary C
+  idiom that Phase T7's struct-return test coverage never happened to
+  exercise. Fixed by treating it like any other "address of a
+  struct-typed rvalue" (`codegen_call_or_builtin` already leaves that
+  address in `eax` on return, per its own established convention).
+- **AS's `.bss` handling overflowed its own 64KB-per-section buffer**:
+  `.resb`'s pass-2 loop materialized real (zero) bytes into
+  `ctx->sec_bytes[SEC_BSS]` even though nothing ever reads them back
+  (both writers skip emitting `.bss` content, matching `SHT_NOBITS`
+  semantics) - fine for kernel-sized `.bss`, but AS's own `ctx` global
+  alone reserves ~20MB of `.bss`. Fixed by passing a `NULL` destination
+  for `.bss` statements in pass 2 (the same "dry-run, length-only" mode
+  pass 1 already uses), so only the *count* is ever tracked.
+- **LD's `MAX_SYMS_PER_FILE`/`MAX_RELOCS_PER_FILE` (512) and
+  `MAX_OUT_SYMS` (2048) were too small**: `toolchain/as/encode.c`'s own
+  object file alone has 800+ symbols (mostly its many small static
+  encoding tables and helpers). Bumped generously (4096 / 4096 / 16384),
+  the same "just raise the fixed limit" fix already used repeatedly in
+  Phase T7.
+- **A short/partial local brace-init left the rest of the aggregate as
+  stack garbage, not zero**: `line_t ln = {0};` for a 3-member struct
+  (one member a 32-element array) only initialized the *first* member;
+  the fix `parse_one_local_decl` already had for globals (a trailing
+  `resb` in `emit_data_bytes`) had no local-variable equivalent. This
+  one was the session's most confusing bug to trace: `ln.n` (an
+  uninitialized bounds counter) and the outer parse loop's "did we
+  reach real EOF" check both silently read garbage, sending AS's own
+  line-tokenizing loop into a multi-million-iteration spin that looked
+  like a hang, not a crash. Fixed with `codegen_zero_range`, a byte-loop
+  that zeroes the whole aggregate up front (redundant but harmless on
+  nested recursive calls) before the existing per-element/member
+  overlay runs.
+- **A string-literal initializer for a *pointer-typed* struct field
+  emitted a null pointer, not a relocation**: `static const regdef_t
+  REGS[] = {{"al",R_AL,1}, ...}` (AS's own register table) - `emit_
+  scalar_bytes` used `v->num` for every non-`TY_CHAR` scalar, but an
+  `ND_STR` node never sets `->num` at all. `REGS[0].name` came out NULL,
+  and `strcmp(NULL, "ebp")` crashed on the very first register lookup.
+  Fixed by checking for `ND_STR` first and emitting `dd <label>` (a real
+  relocation to the string's own bytes) instead.
+- **Pointer-minus-pointer (`s - ctx->syms`, elf_writer.c's own
+  array-position computation for a relocation's symbol index) was typed
+  and compiled as if it were pointer arithmetic, not an integer element
+  count**: `make_binop` labeled *any* `TK_MINUS` between two pointers as
+  itself pointer-typed, so `codegen_binop`'s pointer-arithmetic scaling
+  fired and **multiplied** one operand by the element size instead of
+  **dividing** the raw byte difference by it - `sym_elf_index[garbage]`
+  then read wildly out of bounds. Fixed with real `ptrdiff_t` support:
+  `make_binop` now types `ptr - ptr` as plain `int`, and `codegen_binop`
+  computes the byte difference and divides it by the element size (via
+  `idiv`) as its own explicit case, ahead of the general pointer-
+  arithmetic branch.
+- **`chmod(path, 0755)` in `link_static_exec.c` silently used decimal
+  755, not octal 0755**: CC's numeric-literal lexer only ever recognized
+  a `0x` hex prefix, never a bare leading-zero octal one (never an issue
+  before - nothing in the kernel used octal literals). Every self-hosted-
+  built executable ended up with permission bits `1363` octal instead of
+  `755` (missing owner-read, among other things) - it happened to still
+  be *executable* by the OS (execute doesn't require read), so this was
+  a real, silent correctness bug that never actually broke a test.
+  Rewritten in decimal (493) with a comment explaining why.
+- **AS's own `.dq` (8-byte data directive) computed its high 32 bits as
+  `v >> 32`, which silently becomes `v >> 0` under self-hosting**: not a
+  parsing bug at all - `int64_t` is CC's 32-bit alias (see stdint.h),
+  and x86's `SHR`/`SAR` mask a 32-bit operand's shift count to 5 bits,
+  so a *compiled* `v >> 32` is a no-op, not zero. `boot/boot.S`'s `dq 1`
+  (the disk-address-packet's starting-LBA field) came out as `0x0000000
+  100000001` instead of `1` - the boot sector still assembled and
+  linked without error, and every toolchain test still passed, since
+  none of them touch `dq` at all (only hand-written boot/stage2 assembly
+  does). Only running the *full* `tools/run_tests.sh` against a disk
+  image built end-to-end by the self-hosted toolchain caught this - the
+  kernel never got to print anything, because the boot sector's own INT
+  13h disk read (extended by that corrupted LBA) never loaded stage2 in
+  the first place. Fixed by writing the high word directly as a sign
+  extension (`v < 0 ? 0xFFFFFFFF : 0`) instead of a shift no self-hosted
+  build can trust.

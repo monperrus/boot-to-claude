@@ -28,6 +28,7 @@ int is_builtin_name(const char *name) {
         "__builtin_inb", "__builtin_outb", "__builtin_inw", "__builtin_outw",
         "__builtin_lidt", "__builtin_gdt_flush", "__builtin_hlt",
         "__sys_open", "__sys_read", "__sys_write", "__sys_lseek", "__sys_close", "__sys_exit",
+        "__sys_brk", "__sys_chmod",
         NULL,
     };
     for (int i = 0; names[i]; i++) if (strcmp(name, names[i]) == 0) return 1;
@@ -120,6 +121,18 @@ int builtin_emit_call(const char *name, node_t *args, cc_target_t target,
         emit_arg(nth(args, 1)); emitf("    push eax\n");      /* offset */
         emit_arg(nth(args, 2)); emitf("    mov edx, eax\n");    /* whence */
         emitf("    pop ecx\n    pop ebx\n    mov eax, 19\n    int 0x80\n");
+        return 1;
+    }
+    if (strcmp(name, "__sys_brk") == 0) {
+        /* hostlib.c's malloc: pass 0 to query the current break, or a
+         * target address to extend it - both are the raw brk(2) ABI. */
+        emit_arg(nth(args, 0)); emitf("    mov ebx, eax\n    mov eax, 45\n    int 0x80\n");
+        return 1;
+    }
+    if (strcmp(name, "__sys_chmod") == 0) {
+        emit_arg(nth(args, 0)); emitf("    push eax\n");    /* path */
+        emit_arg(nth(args, 1)); emitf("    mov ecx, eax\n");  /* mode */
+        emitf("    pop ebx\n    mov eax, 15\n    int 0x80\n");
         return 1;
     }
 

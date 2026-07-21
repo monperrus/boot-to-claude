@@ -33,7 +33,13 @@ typedef struct {
 
 static token_t line_peek(line_t *ln) {
     if (ln->pos < ln->n) return ln->toks[ln->pos];
-    return (token_t){ .kind = TK_EOF };
+    /* Not a compound literal (CC doesn't support them - see
+     * docs/toolchain.md, Phase T3/T8): memset then set the one field
+     * that matters, same zeroed-rest semantics as `{ .kind = TK_EOF }`. */
+    token_t t;
+    memset(&t, 0, sizeof(t));
+    t.kind = TK_EOF;
+    return t;
 }
 static token_t line_next(line_t *ln) {
     token_t t = line_peek(ln);
