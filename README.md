@@ -6,9 +6,13 @@ interactive shell, a dynamic scripting language, and a small C-like
 compiler with its own bytecode VM.
 
 Every line of OS/filesystem/language source in this repo is hand-written
-for this project - `nasm`, `gcc`, `ld`, `objcopy`, and `qemu` are used
-purely as build/run infrastructure, the same way any project uses a
-compiler.
+for this project - including the toolchain that builds it. `toolchain/`
+is a self-hosted assembler, C compiler, and linker (see
+[`docs/toolchain.md`](docs/toolchain.md)) that replaces `nasm`/`gcc`/
+`ld`/`objcopy` entirely: the host's real `gcc` is used exactly once, to
+bootstrap the toolchain from source on a fresh checkout, and never
+touches OS code. `qemu-system-i386` stays external - it's the machine we
+run on, not part of what builds for it.
 
 ## Quickstart
 
@@ -46,8 +50,12 @@ tinyfs), and the compiler + bytecode VM (`build` + `exec`, including a
 recursive function call). `tools/run_tests.sh` automates exactly this
 against a headless QEMU instance - see [Testing](#testing).
 
-Requires `nasm`, `gcc` (with `-m32` support), `ld`, `objcopy`, `dd`, and
-`qemu-system-i386` on the host. No cross-compiler needed.
+Requires `dd` and `qemu-system-i386` on the host, plus (one-time only,
+to bootstrap `toolchain/` from source - see below) a host C compiler,
+`gcc` by default. That bootstrap step never runs again after the first
+`build/toolchain/{as,cc,ld}` exist: `nasm`/`ld`/`objcopy` aren't needed
+at all, and `gcc` never touches OS code, only `toolchain/`'s own source.
+No cross-compiler needed.
 
 ## Architecture
 
@@ -75,6 +83,7 @@ implementations - see [`docs/`](docs/) for their designs:
 - [`docs/tinyfs.md`](docs/tinyfs.md) - on-disk filesystem format
 - [`docs/scripting-language.md`](docs/scripting-language.md) - the `tsh` language
 - [`docs/bytecode-isa.md`](docs/bytecode-isa.md) - the compiled language + VM ISA
+- [`docs/toolchain.md`](docs/toolchain.md) - the self-hosted assembler/compiler/linker
 
 ## Repo layout
 
@@ -84,11 +93,17 @@ kernel/          the kernel itself (see architecture diagram above)
 kernel/fs/       tinyfs (shared: freestanding in the kernel, native in mkfs_tinyfs)
 kernel/lang/     shared lexer + the two language implementations
 kernel/shell/    interactive command REPL
+toolchain/       self-hosted AS/CC/LD (see docs/toolchain.md) - host-side
+                   build infrastructure, not OS code, but self-authored
+                   like everything else in this repo
 tools/           host-side build/test infrastructure (not OS code):
-                   mkfs_tinyfs.c   formats + seeds build/disk.img at build time
-                   run_tests.sh    headless QEMU test harness
-                   qemu_type.py    scripts keystrokes into QEMU via its HMP monitor
+                   mkfs_tinyfs.c        formats + seeds build/disk.img at build time
+                   bootstrap_selfhost.sh builds+verifies toolchain/ (Stage1/2/3)
+                   run_tests.sh         headless QEMU test harness
+                   run_toolchain_tests.sh  host-side AS/CC/LD test harness
+                   qemu_type.py         scripts keystrokes into QEMU via its HMP monitor
 tests/           fixtures (*.tsh, *.tc) + tests/expected/ serial-output fixtures
+tests/toolchain/ AS/CC/LD test fixtures (see run_toolchain_tests.sh)
 docs/            design docs, listed above
 ```
 
