@@ -38,6 +38,10 @@ static int scancode_ready(void) {
     return inb(KBD_STATUS) & 1;
 }
 
+int keyboard_has_char(void) {
+    return scancode_ready();
+}
+
 char keyboard_getchar(void) {
     for (;;) {
         while (!scancode_ready()) {}

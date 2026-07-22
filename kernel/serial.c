@@ -36,3 +36,12 @@ void serial_write(const char *s) {
         serial_putc(*s++);
     }
 }
+
+int serial_has_char(void) {
+    return inb(COM1 + 5) & 0x01; /* line status: data ready */
+}
+
+char serial_getc(void) {
+    while (!serial_has_char()) {}
+    return (char)inb(COM1);
+}

@@ -68,10 +68,11 @@ BIOS -> boot/boot.S (MBR, 512B)         real mode
           console.c / serial.c           VGA text + COM1, dual-output throughout
           memory.c                       free-list kmalloc/kfree over a 1MB heap
           ata.c -> fs/tinyfs.c           polled ATA PIO -> tinyfs filesystem
-          keyboard.c -> shell/shell.c    polled PS/2 -> command REPL
+          keyboard.c + input.c -> shell/shell.c   PS/2 or serial RX -> command REPL
           lang/lexer.c (shared)
             -> lang/script/{parser,ast,eval}.c   scripting language (tree-walking)
             -> lang/compiler/{parser,codegen}.c  compiler -> lang/vm.c (bytecode VM)
+          game/game.c                    shell's `play` - see docs/game.md
 ```
 
 Deliberately single-tasking: no scheduler, no preemption, no interrupts
@@ -84,6 +85,7 @@ implementations - see [`docs/`](docs/) for their designs:
 - [`docs/scripting-language.md`](docs/scripting-language.md) - the `tsh` language
 - [`docs/bytecode-isa.md`](docs/bytecode-isa.md) - the compiled language + VM ISA
 - [`docs/toolchain.md`](docs/toolchain.md) - the self-hosted assembler/compiler/linker
+- [`docs/game.md`](docs/game.md) - the `play` battle game, playable over serial only
 
 ## Repo layout
 
@@ -99,9 +101,11 @@ toolchain/       self-hosted AS/CC/LD (see docs/toolchain.md) - host-side
 tools/           host-side build/test infrastructure (not OS code):
                    mkfs_tinyfs.c        formats + seeds build/disk.img at build time
                    bootstrap_selfhost.sh builds+verifies toolchain/ (Stage1/2/3)
-                   run_tests.sh         headless QEMU test harness
+                   run_tests.sh         headless QEMU test harness (keyboard-driven)
+                   run_serial_tests.sh  same, but driven entirely over serial (see docs/game.md)
                    run_toolchain_tests.sh  host-side AS/CC/LD test harness
                    qemu_type.py         scripts keystrokes into QEMU via its HMP monitor
+                   serial_game_test.py  drives kernel/game/ over a serial socket, no keyboard
 tests/           fixtures (*.tsh, *.tc) + tests/expected/ serial-output fixtures
 tests/toolchain/ AS/CC/LD test fixtures (see run_toolchain_tests.sh)
 docs/            design docs, listed above
@@ -123,7 +127,19 @@ for `SELFTEST PASS`, then drives the shell by scripting keystrokes into
 QEMU's HMP monitor over a unix socket (`tools/qemu_type.py sendkey ...`)
 - the only way to feed the kernel's polled PS/2 driver without real
 hardware - and asserts on the resulting serial output for every shell
-command, `run hello.tsh`, and `build`+`exec` on `hello.tc`.
+command, `run hello.tsh`, `build`+`exec` on `hello.tc`, and the `play`
+battle game's menu structure.
+
+```
+tools/run_serial_tests.sh
+```
+
+the same idea, but for `kernel/input.c`'s *other* input path: no
+keyboard/HMP injection at all, driven entirely over a second, genuinely
+bidirectional serial connection (`-serial unix:...,server,nowait`) via
+`tools/serial_game_test.py` - the actual scenario that path exists for
+(an external agent with only a serial connection). See
+[`docs/game.md`](docs/game.md).
 
 ## Boot budget
 

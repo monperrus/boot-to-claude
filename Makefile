@@ -34,7 +34,8 @@ DISK_IMG   := $(BUILD)/disk.img
 KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c kernel/gdt.c \
                  kernel/idt.c kernel/string.c kernel/memory.c kernel/selftest.c \
                  kernel/ata.c kernel/fs/tinyfs.c kernel/fs/tinyfs_disk.c \
-                 kernel/keyboard.c kernel/shell/shell.c \
+                 kernel/keyboard.c kernel/input.c kernel/shell/shell.c \
+                 kernel/game/game.c \
                  kernel/lang/lexer.c kernel/lang/script/ast.c \
                  kernel/lang/script/parser.c kernel/lang/script/eval.c \
                  kernel/lang/compiler/parser.c kernel/lang/compiler/codegen.c \
@@ -63,7 +64,7 @@ MKFS_SEED_SPECS := tests/hello.tsh:hello.tsh tests/hello.tc:hello.tc
 all: $(DISK_IMG)
 
 BUILD_SUBDIRS := $(BUILD) $(BUILD)/toolchain $(BUILD)/fs $(BUILD)/shell \
-                  $(BUILD)/lang $(BUILD)/lang/script $(BUILD)/lang/compiler
+                  $(BUILD)/game $(BUILD)/lang $(BUILD)/lang/script $(BUILD)/lang/compiler
 
 $(BUILD_SUBDIRS):
 	mkdir -p $@

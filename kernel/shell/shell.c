@@ -5,7 +5,8 @@
 #include "builtins.h"
 #include "console.h"
 #include "fs/tinyfs.h"
-#include "keyboard.h"
+#include "game/game.h"
+#include "input.h"
 #include "lang/compiler/codegen.h"
 #include "lang/compiler/parser.h"
 #include "lang/script/eval.h"
@@ -33,7 +34,7 @@ static void print_line(const char *s) {
 static int read_line(char *buf, int max_len) {
     int len = 0;
     for (;;) {
-        char c = keyboard_getchar();
+        char c = input_getchar();
         if (c == '\n') {
             echo_char('\n');
             buf[len] = '\0';
@@ -70,7 +71,7 @@ static int next_word(const char **p, char *out, int max_len) {
 
 static void cmd_help(void) {
     print_line("commands: ls, cat <file>, write <file> <text>, rm <file>, run <file>,");
-    print_line("          build <src> <out>, exec <file>, help, clear, reboot");
+    print_line("          build <src> <out>, exec <file>, play, help, clear, reboot");
 }
 
 static void cmd_ls(void) {
@@ -225,6 +226,8 @@ void shell_run(void) {
             cmd_ls();
         } else if (strcmp(cmd, "clear") == 0) {
             console_clear();
+        } else if (strcmp(cmd, "play") == 0) {
+            game_run();
         } else if (strcmp(cmd, "reboot") == 0) {
             cmd_reboot();
         } else if (strcmp(cmd, "cat") == 0) {

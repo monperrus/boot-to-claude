@@ -101,4 +101,18 @@ wait_for "build: ok"
 type_line "exec hello.tbc"
 check_fixture_output tests/expected/hello.tc.txt
 
+# kernel/game: battle outcomes are RNG-dependent, so this only asserts on
+# the deterministic parts of the flow (menu structure, run/quit
+# mechanics) - see tools/run_serial_tests.sh for a full battle played to
+# an end state, driven entirely over the serial port instead of the
+# keyboard (the scenario this feature exists for - see docs/game.md).
+type_line "play"
+wait_for "Choose your starter:"
+type_line "1"
+wait_for "4) Run"
+type_line "run"
+wait_for "You ran away!"
+type_line "quit"
+wait_for "Left the game."
+
 echo "run_tests: PASS"
