@@ -25,6 +25,9 @@ void vga_clear(uint8_t color);
 void vga_put_pixel(int x, int y, uint8_t color);
 void vga_fill_rect(int x, int y, int w, int h, uint8_t color);
 void vga_draw_rect(int x, int y, int w, int h, uint8_t color);
+void vga_fill_circle(int cx, int cy, int r, uint8_t color);
+void vga_fill_ellipse(int cx, int cy, int rx, int ry, uint8_t color);
+void vga_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint8_t color);
 
 /* 5x7 pixel bitmap font (kernel/font.c) - covers the ASCII range this
  * game's text actually uses. */

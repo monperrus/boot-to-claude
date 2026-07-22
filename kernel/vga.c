@@ -32,7 +32,7 @@ static inline uint8_t inb(uint16_t port) { return __builtin_inb(port); }
 static const uint8_t MODE13_SEQ[5] = { 0x03, 0x01, 0x0F, 0x00, 0x0E };
 static const uint8_t MODE13_CRTC[25] = {
     0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, 0xBF, 0x1F,
-    0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x41, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x9C, 0x0E, 0x8F, 0x28, 0x40, 0x96, 0xB9, 0xA3,
     0xFF,
 };
@@ -220,6 +220,65 @@ void vga_draw_rect(int x, int y, int w, int h, uint8_t color) {
     vga_fill_rect(x, y + h - 1, w, 1, color);
     vga_fill_rect(x, y, 1, h, color);
     vga_fill_rect(x + w - 1, y, 1, h, color);
+}
+
+/* Integer sqrt via Newton's method - the circle/ellipse fillers below are
+ * the only callers, and their radii are always small (sprite/HP-bar
+ * scale), so a few iterations from a rough starting guess is plenty. */
+static int isqrt_approx(int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    int x = n;
+    int y = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    return x;
+}
+
+void vga_fill_circle(int cx, int cy, int r, uint8_t color) {
+    for (int dy = -r; dy <= r; dy++) {
+        int dx = isqrt_approx(r * r - dy * dy);
+        vga_fill_rect(cx - dx, cy + dy, dx * 2 + 1, 1, color);
+    }
+}
+
+void vga_fill_ellipse(int cx, int cy, int rx, int ry, uint8_t color) {
+    if (ry <= 0) {
+        return;
+    }
+    for (int dy = -ry; dy <= ry; dy++) {
+        /* dx/rx = sqrt(1 - (dy/ry)^2), rearranged to stay in integers. */
+        int dx = isqrt_approx((rx * rx) * (ry * ry - dy * dy) / (ry * ry));
+        vga_fill_rect(cx - dx, cy + dy, dx * 2 + 1, 1, color);
+    }
+}
+
+/* Edge function (twice the signed triangle area) - used both to get a
+ * consistent winding-independent inside/outside test and, via its sign,
+ * to handle triangles specified in either winding order. */
+static int edge_fn(int ax, int ay, int bx, int by, int px, int py) {
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+}
+
+void vga_fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2, uint8_t color) {
+    int min_x = x0 < x1 ? (x0 < x2 ? x0 : x2) : (x1 < x2 ? x1 : x2);
+    int max_x = x0 > x1 ? (x0 > x2 ? x0 : x2) : (x1 > x2 ? x1 : x2);
+    int min_y = y0 < y1 ? (y0 < y2 ? y0 : y2) : (y1 < y2 ? y1 : y2);
+    int max_y = y0 > y1 ? (y0 > y2 ? y0 : y2) : (y1 > y2 ? y1 : y2);
+
+    for (int py = min_y; py <= max_y; py++) {
+        for (int px = min_x; px <= max_x; px++) {
+            int w0 = edge_fn(x1, y1, x2, y2, px, py);
+            int w1 = edge_fn(x2, y2, x0, y0, px, py);
+            int w2 = edge_fn(x0, y0, x1, y1, px, py);
+            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
+                vga_put_pixel(px, py, color);
+            }
+        }
+    }
 }
 
 void vga_draw_char(int x, int y, char c, uint8_t color) {

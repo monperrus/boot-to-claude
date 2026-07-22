@@ -36,7 +36,7 @@ KERNEL_C_SRCS := kernel/kmain.c kernel/console.c kernel/serial.c kernel/gdt.c \
                  kernel/ata.c kernel/fs/tinyfs.c kernel/fs/tinyfs_disk.c \
                  kernel/keyboard.c kernel/input.c kernel/vga.c kernel/font.c \
                  kernel/shell/shell.c \
-                 kernel/game/game.c \
+                 kernel/game/game.c kernel/game/battle_gui.c kernel/game/sprites.c \
                  kernel/lang/lexer.c kernel/lang/script/ast.c \
                  kernel/lang/script/parser.c kernel/lang/script/eval.c \
                  kernel/lang/compiler/parser.c kernel/lang/compiler/codegen.c \

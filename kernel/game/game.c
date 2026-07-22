@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "battle_gui.h"
 #include "console.h"
 #include "input.h"
 #include "serial.h"
@@ -131,6 +132,37 @@ static int compute_damage(mon_type_t attacker_type, mon_type_t defender_type, in
     return dmg;
 }
 
+/* Concatenates up to 4 strings (any may be NULL) into out, truncating to
+ * n-1 bytes - this kernel has no snprintf, and every graphical message
+ * this module builds is a small, fixed number of parts. Duplicated from
+ * battle_gui.c's identical helper rather than shared, matching this
+ * codebase's existing convention of small per-module helper duplication
+ * (see shell.c's read_line vs. this file's, or its echo_char). */
+static void gcat(char *out, int n, const char *a, const char *b, const char *c, const char *d) {
+    int k = 0;
+    if (a) {
+        for (int i = 0; a[i] && k < n - 1; i++) {
+            out[k++] = a[i];
+        }
+    }
+    if (b) {
+        for (int i = 0; b[i] && k < n - 1; i++) {
+            out[k++] = b[i];
+        }
+    }
+    if (c) {
+        for (int i = 0; c[i] && k < n - 1; i++) {
+            out[k++] = c[i];
+        }
+    }
+    if (d) {
+        for (int i = 0; d[i] && k < n - 1; i++) {
+            out[k++] = d[i];
+        }
+    }
+    out[k] = '\0';
+}
+
 /* --- status line helpers --- */
 
 static void print_hp(const char *label, const char *name, int hp, int max_hp) {
@@ -168,6 +200,11 @@ static int parse_choice(const char *line) {
  * player typed "quit". */
 static int choose_starter(void) {
     char line[LINE_MAX];
+    const char *names[NUM_SPECIES];
+    for (int i = 0; i < NUM_SPECIES; i++) {
+        names[i] = SPECIES[i].name;
+    }
+    battle_gui_starter_select(names);
     wln("Choose your starter:");
     for (int i = 0; i < NUM_SPECIES; i++) {
         w_int(i + 1);
@@ -191,7 +228,11 @@ static int choose_starter(void) {
     }
 }
 
-void game_run(void) {
+/* All the game logic and its several early returns live here, unchanged
+ * in behavior from before the graphics existed - game_run() below just
+ * wraps it with a single, guaranteed battle_gui_enter/exit pair instead
+ * of needing a matching exit call before every return. */
+static void game_run_inner(void) {
     char line[LINE_MAX];
 
     wln("=== Tiny Monsters ===");
@@ -218,6 +259,14 @@ void game_run(void) {
         w_int(stage);
         wln(")");
 
+        {
+            char msg[48];
+            gcat(msg, sizeof(msg), "A wild ", wild->name, " appears!", NULL);
+            battle_gui_scene(player_idx, player_hp, player->max_hp, player->name,
+                              wild_idx, wild_hp, wild_max_hp, wild->name);
+            battle_gui_message(msg, NULL);
+        }
+
         for (;;) {
             print_hp("Your ", player->name, player_hp, player->max_hp);
             print_hp("Wild ", wild->name, wild_hp, wild_max_hp);
@@ -230,6 +279,19 @@ void game_run(void) {
                 wln(")");
             }
             wln("4) Run");
+
+            {
+                const char *move_names[3];
+                int move_powers[3];
+                for (int i = 0; i < 3; i++) {
+                    move_names[i] = player->moves[i].name;
+                    move_powers[i] = player->moves[i].power;
+                }
+                battle_gui_scene(player_idx, player_hp, player->max_hp, player->name,
+                                  wild_idx, wild_hp, wild_max_hp, wild->name);
+                battle_gui_menu(move_names, move_powers);
+            }
+
             w("> ");
             read_line(line, sizeof(line));
             int choice = parse_choice(line);
@@ -240,6 +302,7 @@ void game_run(void) {
             }
             if (choice == 0 || choice == 4) {
                 wln("You ran away!");
+                battle_gui_message("You ran away!", NULL);
                 break; /* next encounter, same stage */
             }
             if (choice < 1 || choice > 3) {
@@ -268,15 +331,28 @@ void game_run(void) {
             w_int(wild_max_hp);
             wln(")");
 
+            {
+                char msg1[48];
+                char msg2[24];
+                char dmg_buf[8];
+                gcat(msg1, sizeof(msg1), "Your ", player->name, " used ", mv->name);
+                gcat(msg2, sizeof(msg2), "-", itoa(dmg, dmg_buf, 10), " HP", NULL);
+                battle_gui_scene(player_idx, player_hp, player->max_hp, player->name,
+                                  wild_idx, wild_hp, wild_max_hp, wild->name);
+                battle_gui_message(msg1, msg2);
+            }
+
             if (wild_hp <= 0) {
                 w("Wild ");
                 w(wild->name);
                 wln(" fainted! You win!");
+                battle_gui_message("Wild fainted! You win!", NULL);
                 stage++;
                 if (stage > WIN_STAGE) {
                     w("*** You defeated ");
                     w_int(WIN_STAGE);
                     wln(" wild monsters - you are the Champion! ***");
+                    battle_gui_message("You are the Champion!", NULL);
                     return;
                 }
                 break; /* next encounter */
@@ -303,14 +379,32 @@ void game_run(void) {
             w_int(player->max_hp);
             wln(")");
 
+            {
+                char msg1[48];
+                char msg2[24];
+                char dmg_buf[8];
+                gcat(msg1, sizeof(msg1), "Wild ", wild->name, " used ", wmv->name);
+                gcat(msg2, sizeof(msg2), "-", itoa(wdmg, dmg_buf, 10), " HP", NULL);
+                battle_gui_scene(player_idx, player_hp, player->max_hp, player->name,
+                                  wild_idx, wild_hp, wild_max_hp, wild->name);
+                battle_gui_message(msg1, msg2);
+            }
+
             if (player_hp <= 0) {
                 w("Your ");
                 w(player->name);
                 w(" fainted... Game over! You reached stage ");
                 w_int(stage);
                 wln(".");
+                battle_gui_message("Your monster fainted...", "Game over!");
                 return;
             }
         }
     }
+}
+
+void game_run(void) {
+    battle_gui_enter();
+    game_run_inner();
+    battle_gui_exit();
 }

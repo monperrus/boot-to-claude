@@ -23,6 +23,33 @@ connected over serial can drive either one interchangeably, in the same
 session, with no configuration - matching the existing dual-*output*
 convention rather than adding a new, separate input mode.
 
+## Graphical battle screen
+
+When there's a real display attached (`make run-gui`, or any QEMU
+invocation with a display backend), the game also renders a GBA-Pokemon-
+style battle screen: sky/ground background, both combatants' sprites and
+platforms, HP bars, and a dialogue/menu box - drawn via direct VGA mode
+0x13 register programming (`kernel/vga.c`, `docs/toolchain.md`-adjacent
+bare-metal register I/O, no BIOS/VBE calls). Purely additive: every
+`console_write`/`serial_write` call and every `input_getchar()` read
+this file already made are unchanged, so an agent playing over serial
+sees exactly the same text stream whether or not anyone is watching the
+graphical side. `kernel/game/sprites.c` draws the three starters
+procedurally (circles/ellipses/triangles from `vga.c`, the same
+hand-authored-primitives approach as `kernel/font.c`'s stroke-based
+glyphs) rather than from a stored image asset.
+
+Returning to the shell restores 80x25 text mode, including the real
+BIOS-loaded font glyphs (mode 0x13 drawing and text-mode character data
+share the same underlying VGA RAM - see `vga.c`'s comments on plane 2
+save/restore).
+
+Since there's no timer interrupt in this kernel, each battle message
+holds on screen for a fixed busy-wait spin (`battle_gui.c`'s
+`gui_pause`) rather than a calibrated real-time delay - long enough to
+read, uncalibrated by design (nothing here depends on its exact
+duration; an AI agent isn't reading pixels).
+
 ## Playing over serial
 
 Boot with a bidirectional serial backend instead of (or in addition to)

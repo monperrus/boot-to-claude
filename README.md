@@ -72,7 +72,8 @@ BIOS -> boot/boot.S (MBR, 512B)         real mode
           lang/lexer.c (shared)
             -> lang/script/{parser,ast,eval}.c   scripting language (tree-walking)
             -> lang/compiler/{parser,codegen}.c  compiler -> lang/vm.c (bytecode VM)
-          game/game.c                    shell's `play` - see docs/game.md
+          vga.c / font.c                 mode 0x13 VGA driver + hand-authored bitmap font
+          game/game.c, battle_gui.c, sprites.c   shell's `play` - see docs/game.md
 ```
 
 Deliberately single-tasking: no scheduler, no preemption, no interrupts
@@ -95,6 +96,7 @@ kernel/          the kernel itself (see architecture diagram above)
 kernel/fs/       tinyfs (shared: freestanding in the kernel, native in mkfs_tinyfs)
 kernel/lang/     shared lexer + the two language implementations
 kernel/shell/    interactive command REPL
+kernel/game/     the `play` battle game + its VGA battle-screen rendering
 toolchain/       self-hosted AS/CC/LD (see docs/toolchain.md) - host-side
                    build infrastructure, not OS code, but self-authored
                    like everything else in this repo
