@@ -4,3 +4,4 @@ build/
 *.img
 *.tbc
 *.elf
+recordings/
